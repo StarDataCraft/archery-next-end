@@ -1,7 +1,7 @@
 # src/refine_points.py
 from __future__ import annotations
 
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any, Optional, Union
 import numpy as np
 import cv2
 
@@ -26,12 +26,12 @@ def _subpix_refine(gray_roi: np.ndarray, pt: Tuple[float, float]) -> Tuple[float
 
 
 # ----------------------------------------------------------------------
-# NEW: robust color sampling (ignore dark arrow pixels)
+# Robust + backward-compatible color sampling (ignore dark arrow pixels)
 # ----------------------------------------------------------------------
 def _mask_dark_arrow_pixels(hsv_roi: np.ndarray) -> np.ndarray:
     """
     hsv_roi: OpenCV HSV (H:0-180, S:0-255, V:0-255)
-    Returns a boolean mask where True means "likely target face (not arrow)".
+    Returns boolean mask where True means "likely target face (not arrow)".
     """
     v = hsv_roi[:, :, 2]
     # carbon/arrow/holes tend to be low V
@@ -39,49 +39,72 @@ def _mask_dark_arrow_pixels(hsv_roi: np.ndarray) -> np.ndarray:
 
 
 def sample_contact_color_hsv(
-    bgr: np.ndarray,
-    x: float,
-    y: float,
-    r: int = 10,
+    rect_bgr: np.ndarray,
+    x_or_xy: Union[float, Tuple[float, float]],
+    y: Optional[float] = None,
+    *,
+    roi_radius: Optional[int] = None,
+    r: Optional[int] = None,
 ) -> Optional[Tuple[float, float, float]]:
     """
-    Sample color near (x,y) while ignoring arrow pixels (often dark).
-    Strategy:
-      - take a small disk ROI (square crop)
-      - convert to HSV
-      - mask out low-V pixels (dark arrow/carbon)
-      - median HSV of remaining pixels
-    Returns (H,S,V) in OpenCV scale, or None if fails.
+    Backward compatible sampler.
+
+    Supported calls:
+      1) sample_contact_color_hsv(rect_bgr, (x,y), roi_radius=18)
+      2) sample_contact_color_hsv(rect_bgr, x, y, r=10)
+      3) sample_contact_color_hsv(rect_bgr, (x,y), r=10)
+      4) sample_contact_color_hsv(rect_bgr, x, y, roi_radius=18)
+
+    Returns OpenCV HSV median as (H,S,V) in scales H:[0,180], S/V:[0,255]
     """
-    h, w = bgr.shape[:2]
-    cx, cy = int(round(x)), int(round(y))
+    # Resolve coordinates
+    if y is None:
+        if not (isinstance(x_or_xy, (tuple, list)) and len(x_or_xy) == 2):
+            raise TypeError("sample_contact_color_hsv: expected (x,y) tuple/list when y is None")
+        x = float(x_or_xy[0])
+        yv = float(x_or_xy[1])
+    else:
+        x = float(x_or_xy)
+        yv = float(y)
 
-    x1 = max(0, cx - r)
-    y1 = max(0, cy - r)
-    x2 = min(w, cx + r + 1)
-    y2 = min(h, cy + r + 1)
+    # Resolve radius: prefer roi_radius; fallback to r; default 10
+    rad = roi_radius if roi_radius is not None else r
+    if rad is None:
+        rad = 10
+    rad = int(rad)
 
-    roi = bgr[y1:y2, x1:x2]
+    h, w = rect_bgr.shape[:2]
+    cx, cy = int(round(x)), int(round(yv))
+
+    x1 = max(0, cx - rad)
+    y1 = max(0, cy - rad)
+    x2 = min(w, cx + rad + 1)
+    y2 = min(h, cy + rad + 1)
+
+    roi = rect_bgr[y1:y2, x1:x2]
     if roi.size == 0:
         return None
 
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     keep = _mask_dark_arrow_pixels(hsv)
 
-    # if too occluded, fall back to raw median
+    # If too many pixels are masked (arrow covers most), fall back to unmasked median
     if int(np.sum(keep)) < 10:
-        med = np.median(hsv.reshape(-1, 3).astype(np.float32), axis=0)
-        return (float(med[0]), float(med[1]), float(med[2]))
+        pixels = hsv.reshape(-1, 3).astype(np.float32)
+    else:
+        pixels = hsv[keep].reshape(-1, 3).astype(np.float32)
 
-    hsv_kept = hsv[keep].reshape(-1, 3).astype(np.float32)
-    med = np.median(hsv_kept, axis=0)
+    if pixels.size == 0:
+        return None
+
+    med = np.median(pixels, axis=0)
     return (float(med[0]), float(med[1]), float(med[2]))
 
 
 def _sample_face_color_under_arrow(bgr: np.ndarray, x: float, y: float, r: int = 10) -> Dict[str, Any]:
     """
-    (Kept for backward-compat with your pipeline)
-    Now implemented via sample_contact_color_hsv() for robustness.
+    (Backward-compat with pipeline)
+    Implemented via sample_contact_color_hsv() for robustness.
     Returns:
       {"ok": bool, "hsv_median": [H,S,V], "note": "..."}
     """
@@ -89,13 +112,15 @@ def _sample_face_color_under_arrow(bgr: np.ndarray, x: float, y: float, r: int =
     if hsv is None:
         return {"ok": False}
 
-    # Decide note: whether likely masked vs fallback is not directly exposed now.
-    # Keep "note" stable for consumers.
-    return {"ok": True, "hsv_median": [int(round(hsv[0])), int(round(hsv[1])), int(round(hsv[2]))], "note": "masked_dark"}
+    return {
+        "ok": True,
+        "hsv_median": [int(round(hsv[0])), int(round(hsv[1])), int(round(hsv[2]))],
+        "note": "masked_dark_or_fallback",
+    }
 
 
 # ----------------------------------------------------------------------
-# Arrow segment + contact point refinement (ORIGINAL LOGIC PRESERVED)
+# Arrow segment + contact point refinement (kept)
 # ----------------------------------------------------------------------
 def _best_arrow_segment_in_roi(roi_g: np.ndarray, min_len: int) -> Optional[Tuple[int, int, int, int]]:
     """Prefer LSD (more stable than Hough) if available."""
@@ -141,9 +166,8 @@ def _best_arrow_segment_in_roi(roi_g: np.ndarray, min_len: int) -> Optional[Tupl
 def _find_contact_point(gray_roi: np.ndarray, line: Tuple[int, int, int, int], center_roi: Tuple[float, float]) -> Tuple[float, float]:
     """
     Contact point ≈ first strong edge peak near tip-side (endpoint closer to center).
-    Improve over previous:
-      - use gradient magnitude
-      - pick *earliest* strong peak within first N px from tip into shaft direction
+    - use gradient magnitude
+    - pick earliest strong peak within first N px from tip into shaft direction
     """
     x1, y1, x2, y2 = line
     cx, cy = center_roi
@@ -161,16 +185,14 @@ def _find_contact_point(gray_roi: np.ndarray, line: Tuple[int, int, int, int], c
     L = float(np.linalg.norm(v))
     if L < 8:
         return float(tip[0]), float(tip[1])
-    v = v / L
+    v = v / (L + 1e-12)
 
     gX = cv2.Sobel(gray_roi, cv2.CV_32F, 1, 0, ksize=3)
     gY = cv2.Sobel(gray_roi, cv2.CV_32F, 0, 1, ksize=3)
     mag = np.sqrt(gX * gX + gY * gY)
 
     scan_n = int(min(55, max(18, L * 0.35)))
-    vals = []
-    xs = []
-    ys = []
+    vals, xs, ys = [], [], []
     for i in range(scan_n):
         p = tip + v * i
         px, py = int(round(p[0])), int(round(p[1]))
@@ -230,14 +252,13 @@ def refine_points_and_colors(
                 colors.append(_sample_face_color_under_arrow(rect_bgr, fx, fy, r=10))
                 continue
 
-            # fallback: subpix around coarse
             rx, ry = _subpix_refine(roi_g, (lx, ly))
             fx, fy = rx + x1, ry + y1
             refined.append((fx, fy))
             colors.append(_sample_face_color_under_arrow(rect_bgr, fx, fy, r=10))
             continue
 
-        # no arrow: blob/hole path (keep simple but stable)
+        # no arrow: blob/hole path (stable)
         g = cv2.GaussianBlur(roi_g, (0, 0), 1.2)
         lap = cv2.Laplacian(g, cv2.CV_32F, ksize=3)
         lap = np.abs(lap)
