@@ -8,7 +8,7 @@ def _dir_word(dx: float, dy: float, lang: str) -> str:
         return {"en": "centered", "ja": "中央", "zh": "居中"}[lang]
 
     horiz = "right" if dx > 0 else "left"
-    vert = "low" if dy > 0 else "high"  # y down
+    vert = "low" if dy > 0 else "high"  # y down in image coords
 
     maps = {
         "en": {"left": "left", "right": "right", "high": "high", "low": "low"},
@@ -26,8 +26,13 @@ def next_end_advice(
     arrow_present: bool,
     lang: str = "en",
 ) -> Dict[str, Any]:
+    """
+    No-LLM, flexible text:
+    - build a context string
+    - retrieve top patterns from Art of Repetition KB
+    - combine with a compact, 'one thing' cue
+    """
     lang = lang if lang in ("en", "ja", "zh") else "en"
-
     n = int(metrics.get("n", 0))
     cx = float(metrics.get("cx", 0.0))
     cy = float(metrics.get("cy", 0.0))
@@ -42,9 +47,9 @@ def next_end_advice(
     if n <= 1:
         title = {"en": "Single-arrow cue", "ja": "1本だけのヒント", "zh": "单箭提示"}[lang]
         cue = {
-            "en": f"Hit is {dirw}. Next end: keep the same rhythm; keep the front side quiet (no shoulder lift / no collapse).",
-            "ja": f"着弾は「{dirw}」。次はリズム固定、フロント側を静かに（肩が上がらない・潰れない）。",
-            "zh": f"落点在「{dirw}」。下一轮节奏固定，前侧保持安静（别耸肩、别塌）。",
+            "en": f"Hit is {dirw}. Next end: keep the same rhythm, and confirm the front side stays ‘quiet’ (no shoulder lift / no collapse).",
+            "ja": f"着弾は「{dirw}」。次はリズム優先、フロント側を静かに（肩が上がらない・潰れない）。",
+            "zh": f"落点在「{dirw}」。下一轮先稳节奏，前侧保持安静（肩别耸、别塌）。",
         }[lang]
     else:
         title = {"en": "Next-end cue", "ja": "次エンドの合図", "zh": "下一轮提示"}[lang]
@@ -54,18 +59,17 @@ def next_end_advice(
             "zh": f"重心在「{dirw}」。形状={shape} / 离散≈{spread:.0f}px / 角度≈{slope:.0f}°。下一轮先稳节奏，只修一个点。",
         }[lang]
 
-    # —— build retrieval context (flexible) ——
+    # Context for retrieval (flexibility comes from here)
     ctx = (
-        f"archery recurve. distance {distance_m}m. handedness {handedness}. "
-        f"arrow_present {arrow_present}. group shape {shape}. spread {spread:.1f}. "
+        f"recurve archery pattern. distance {distance_m}m. "
+        f"handedness {handedness}. arrow_present {arrow_present}. "
+        f"group shape {shape}. spread {spread:.1f}. slope {slope:.1f}. "
         f"centroid dx {dx:.1f} dy {dy:.1f}. "
     )
     if distance_m <= 18 and spread > 55:
-        ctx += "group larger at short distance. clearance likely. "
+        ctx += "group larger at short distance clearance. "
     if distance_m >= 50 and spread > 75:
-        ctx += "group larger at long distance drift. speed matters. "
-    if shape in ("horizontal", "vertical"):
-        ctx += f"group elongated {shape}. timing consistency. "
+        ctx += "group larger at long distance drift. "
 
     top = retrieve_patterns(ctx, k=3)
 
@@ -77,9 +81,9 @@ def next_end_advice(
 
     if not why_lines:
         why_lines = [{
-            "en": "Keep it boring: repeat the same shot. If it’s unstable, clean up clearance/alignment before micro-tuning.",
-            "ja": "地味でOK：同じ動作を反復。不安定なら微調整より先にクリアランスとアライメント。",
-            "zh": "无聊但有效：重复同一动作。不稳定先查清弦与对齐，再谈微调。",
+            "en": "Keep it boring: repeat setup and execution. If something is unstable, fix clearance and alignment before micro-adjustments.",
+            "ja": "地味でOK：同じセットアップと動作を繰り返す。不安定なら微調整より先にクリアランスとアライメント。",
+            "zh": "越无聊越有效：重复同一套动作。不稳定先查清弦和对齐，再谈微调。",
         }[lang]]
 
     return {"title": title, "cue": cue, "why": "\n".join([f"- {x}" for x in why_lines])}
