@@ -11,8 +11,8 @@ from .metrics import compute_metrics, classify_shape
 from .rules import next_end_advice
 from .storage import make_log_entry, export_log_json
 from .cv_target import rectify_target, transform_points, propose_hit_points
-from .refine_points import refine_points_and_colors
-from .scoring import score_hits
+from .refine_points import refine_points_and_colors, sample_contact_color_hsv
+from .scoring import score_hits_color_aware
 from .target_face import render_target_face_bgr
 
 CANON_SIZE = 900
@@ -77,6 +77,18 @@ def _draw_hits_on_face(face_bgr, points_xy, scores):
     return img
 
 
+def _canon_to_rect_points(points_xy, M_rect_to_canon):
+    """
+    Convert canonical points back to rect points using inverse affine.
+    """
+    if not points_xy:
+        return []
+    Minv = cv2.invertAffineTransform(M_rect_to_canon.astype(np.float32))
+    pts = np.array(points_xy, dtype=np.float32).reshape(-1, 1, 2)
+    out = cv2.transform(pts, Minv).reshape(-1, 2)
+    return [(float(x), float(y)) for x, y in out]
+
+
 def render_analyze_step():
     lang = st.session_state.language
     st.title(t("title", lang))
@@ -125,7 +137,7 @@ def render_analyze_step():
     st.subheader(t("upload", lang))
     file = st.file_uploader("", type=["png", "jpg", "jpeg"])
     if not file:
-        st.info("Upload → pose(rectify) → propose tips → refine contact → map to canonical → confirm → analyze")
+        st.info("Upload → rectify → propose → refine → map → confirm → analyze")
         return
 
     img_pil = Image.open(file).convert("RGB")
@@ -145,7 +157,6 @@ def render_analyze_step():
             ring_line_thickness=2,
         )
 
-        # 1) global candidates
         coarse = propose_hit_points(
             rect_res.rect_bgr,
             rect_res.center_final,
@@ -153,8 +164,7 @@ def render_analyze_step():
             max_points=max(need, 12),
         )
 
-        # 2) refine contact points + face color estimate
-        refined_rect_pts, contact_colors = refine_points_and_colors(
+        refined_rect_pts, _ = refine_points_and_colors(
             rect_res.rect_bgr,
             target_center=rect_res.center_final,
             coarse_points=coarse,
@@ -162,35 +172,22 @@ def render_analyze_step():
             roi_radius=70,
         )
 
-        # de-dup refined points
-        dedup = []
-        dedup_cols = []
-        min_d2 = 18.0**2
-        for p, col in zip(refined_rect_pts, contact_colors):
-            ok = True
-            for q in dedup:
-                if (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 < min_d2:
-                    ok = False
-                    break
-            if ok:
-                dedup.append(p)
-                dedup_cols.append(col)
-
-        # 3) map to canonical
-        auto_pts_canon = transform_points(dedup, rect_res.M_rect_to_canon)
+        # map to canonical
+        auto_pts_canon = transform_points(refined_rect_pts, rect_res.M_rect_to_canon)
 
         st.session_state.cv_cache_key = cache_key
         st.session_state.overlay_image_rgb = _bgr_to_rgb_uint8(face_bgr)
         st.session_state.auto_points = auto_pts_canon
-        st.session_state.auto_contact_colors = dedup_cols
         st.session_state.points = []
         st.session_state.last_result = None
+
+        # keep geometry + rectified photo + transform for later (color sampling on analyze)
         st.session_state._geom_center = CANON_CENTER
         st.session_state._geom_outer = CANON_OUTER
-        st.session_state._rect_photo_rgb = _bgr_to_rgb_uint8(rect_res.rect_bgr)
+        st.session_state._rect_photo_bgr = rect_res.rect_bgr.copy()
+        st.session_state._M_rect_to_canon = rect_res.M_rect_to_canon.copy()
         st.session_state.warp_debug = rect_res.debug
 
-        # NEW: quality in session
         st.session_state.cv_quality = {
             "score": float(rect_res.quality_score),
             "flags": list(rect_res.quality_flags),
@@ -203,14 +200,8 @@ def render_analyze_step():
     quality = st.session_state.get("cv_quality", None)
 
     st.subheader(t("tap_points", lang))
-    st.caption("Pose first (midline/X + circle refine) → then contact points. Purple = hits.")
-
-    with st.expander("CV debug (pose + color)"):
+    with st.expander("CV debug"):
         st.write(st.session_state.warp_debug)
-        st.image(st.session_state._rect_photo_rgb, caption="Rectified photo (debug)", use_column_width=False)
-        cols = st.session_state.get("auto_contact_colors", [])
-        if cols:
-            st.write({"contact_face_color_preview": cols[: min(10, len(cols))]})
         if quality is not None:
             st.write({"quality": quality})
 
@@ -247,13 +238,19 @@ def render_analyze_step():
             return
 
         pts_xy = [(p["x"], p["y"]) for p in points[:need]]
-        scoring = score_hits(center, outer, pts_xy)
 
-        # NEW: center/outer-aware metrics (offset + ratios)
+        # ---- NEW: sample contact HSV on rectified photo at the corresponding rect point ----
+        rect_bgr = st.session_state._rect_photo_bgr
+        M_rect_to_canon = st.session_state._M_rect_to_canon
+
+        rect_pts = _canon_to_rect_points(pts_xy, M_rect_to_canon)
+        hsvs = [sample_contact_color_hsv(rect_bgr, rp, roi_radius=18) for rp in rect_pts]
+
+        scoring = score_hits_color_aware(center, outer, pts_xy, contact_hsvs=hsvs)
+
         metrics = compute_metrics(points[:need], center=center, outer_radius_px=outer)
         shape = classify_shape(metrics)
 
-        # NEW: quality-aware advice
         advice = next_end_advice(
             metrics,
             shape,
@@ -273,6 +270,7 @@ def render_analyze_step():
             "scoring": scoring,
             "overlay_hits_rgb": overlay_hits_rgb,
             "quality": quality,
+            "color_debug": scoring.get("details", []),
         }
         st.rerun()
 
@@ -288,21 +286,19 @@ def render_analyze_step():
         st.subheader("Overlay (standard face + hits + scores)")
         st.image(res["overlay_hits_rgb"], use_column_width=False)
 
-        st.subheader("Score")
+        st.subheader("Score (color-aware)")
         st.write(f"- Total: **{scoring['total']}** / {need * 10}")
         st.write(f"- Avg: **{scoring['avg']:.2f}**")
         st.write(f"- Per arrow: {scoring['scores']}")
 
+        with st.expander("Per-arrow debug (radial vs color band)"):
+            st.write(res.get("color_debug", []))
+
         st.subheader("Grouping metrics (reference)")
         st.write(f"- Shape: **{res['shape']}**")
         st.write(f"- Spread (avg): **{metrics['spread']:.1f} px**")
-        st.write(f"- sx / sy: **{metrics['sx']:.1f} / {metrics['sy']:.1f}**")
         st.write(f"- Direction: **{metrics['slope_deg']:.0f}°**")
         st.write(f"- Offset dx/dy: **{offset.get('dx', 0.0):.1f} / {offset.get('dy', 0.0):.1f} px**")
-        if metrics.get("offset_ratio", None) is not None:
-            st.write(f"- Offset ratio: **{metrics['offset_ratio']:.3f}**")
-        if metrics.get("spread_ratio", None) is not None:
-            st.write(f"- Spread ratio: **{metrics['spread_ratio']:.3f}**")
         if quality is not None:
             st.write(f"- CV quality: **{float(quality.get('score', 1.0)):.2f}** ({quality.get('flags', [])})")
 
