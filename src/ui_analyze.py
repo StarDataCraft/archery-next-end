@@ -23,7 +23,27 @@ CANON_OUTER = CANON_SIZE * 0.45  # 405 px
 
 def _bgr_to_rgb_uint8(bgr: np.ndarray) -> np.ndarray:
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    return rgb.astype(np.uint8)
+    if rgb.dtype != np.uint8:
+        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+    return rgb
+
+
+def _ensure_rgb_uint8(rgb: np.ndarray) -> np.ndarray:
+    """Make sure it's HxWx3 uint8 contiguous."""
+    if rgb is None:
+        raise ValueError("RGB image is None")
+    if not isinstance(rgb, np.ndarray):
+        raise TypeError(f"RGB image must be ndarray, got {type(rgb)}")
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise ValueError(f"RGB image must be HxWx3, got shape {rgb.shape}")
+    if rgb.dtype != np.uint8:
+        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+    return np.ascontiguousarray(rgb)
+
+
+def _to_pil_rgb(rgb: np.ndarray) -> Image.Image:
+    rgb = _ensure_rgb_uint8(rgb)
+    return Image.fromarray(rgb, mode="RGB")
 
 
 def _points_to_initial_drawing(points, r=10):
@@ -76,6 +96,22 @@ def _draw_hits_on_face(face_bgr, points_xy, scores):
     return img
 
 
+def _cv_cache_is_complete() -> bool:
+    """Guard against session_state partial loss causing st_canvas crash."""
+    if "overlay_image_rgb" not in st.session_state:
+        return False
+    if "auto_points" not in st.session_state:
+        return False
+    bg = st.session_state.overlay_image_rgb
+    if bg is None:
+        return False
+    if not isinstance(bg, np.ndarray):
+        return False
+    if bg.ndim != 3 or bg.shape[2] != 3:
+        return False
+    return True
+
+
 def render_analyze_step():
     lang = st.session_state.language
     st.title(t("title", lang))
@@ -87,8 +123,9 @@ def render_analyze_step():
             value=int(st.session_state.distance_m), step=1
         )
     with top2:
+        # ✅ min arrows: 1
         st.session_state.arrows_per_end = st.number_input(
-            t("arrows", lang), min_value=3, max_value=12,
+            t("arrows", lang), min_value=1, max_value=12,
             value=int(st.session_state.arrows_per_end), step=1
         )
     with top3:
@@ -102,6 +139,8 @@ def render_analyze_step():
             st.session_state.target_face = face
             st.session_state.last_result = None
             st.session_state.overlay_image_rgb = None
+            # force recompute
+            st.session_state.cv_cache_key = None
 
     colA, colB = st.columns([1, 1])
     with colA:
@@ -112,6 +151,11 @@ def render_analyze_step():
         if st.button(t("clear", lang), use_container_width=True):
             reset_shot()
             reset_cv_cache()
+            # also clear these to avoid partial-state crash
+            st.session_state.cv_cache_key = None
+            st.session_state.overlay_image_rgb = None
+            st.session_state.auto_points = []
+            st.session_state.auto_contact_colors = []
             st.rerun()
 
     st.divider()
@@ -128,6 +172,10 @@ def render_analyze_step():
     cache_key = f"{getattr(file, 'name', 'upload')}-{img_rgb.shape[0]}x{img_rgb.shape[1]}"
     need = int(st.session_state.arrows_per_end)
 
+    # ✅ cache integrity guard: if cache_key matches but state incomplete, force recompute
+    if st.session_state.get("cv_cache_key") == cache_key and not _cv_cache_is_complete():
+        st.session_state.cv_cache_key = None
+
     if st.session_state.get("cv_cache_key") != cache_key:
         rect_res = rectify_target(img_rgb, out_size=CANON_SIZE)
 
@@ -140,7 +188,6 @@ def render_analyze_step():
             ring_line_thickness=2,
         )
 
-        # 1) global candidates from arrow shafts / blobs
         coarse = propose_hit_points(
             rect_res.rect_bgr,
             rect_res.center_final,
@@ -148,7 +195,6 @@ def render_analyze_step():
             max_points=max(need, 12),
         )
 
-        # 2) refine -> contact point + face color estimate
         refined_rect_pts, contact_colors = refine_points_and_colors(
             rect_res.rect_bgr,
             target_center=rect_res.center_final,
@@ -157,7 +203,6 @@ def render_analyze_step():
             roi_radius=70,
         )
 
-        # de-dup refined points
         dedup = []
         dedup_cols = []
         min_d2 = 18.0 ** 2
@@ -171,7 +216,6 @@ def render_analyze_step():
                 dedup.append(p)
                 dedup_cols.append(col)
 
-        # 3) map to canonical using pose matrix (critical)
         auto_pts_canon = transform_points(dedup, rect_res.M_rect_to_canon)
 
         st.session_state.cv_cache_key = cache_key
@@ -206,11 +250,14 @@ def render_analyze_step():
     if not st.session_state.points:
         initial = _points_to_initial_drawing(auto_pts[:need], r=10)
 
+    # ✅ robust PIL conversion for canvas background
+    bg_pil = _to_pil_rgb(bg_rgb)
+
     canvas = st_canvas(
         fill_color="rgba(180, 0, 255, 0.22)",
         stroke_width=3,
         stroke_color="rgba(180, 0, 255, 0.95)",
-        background_image=Image.fromarray(bg_rgb),
+        background_image=bg_pil,
         update_streamlit=True,
         height=700,
         width=700,
@@ -241,7 +288,7 @@ def render_analyze_step():
         shape = classify_shape(metrics)
         advice = next_end_advice(metrics, shape, st.session_state.handedness, lang=lang)
 
-        face_bgr = cv2.cvtColor(bg_rgb, cv2.COLOR_RGB2BGR)
+        face_bgr = cv2.cvtColor(_ensure_rgb_uint8(bg_rgb), cv2.COLOR_RGB2BGR)
         overlay_hits = _draw_hits_on_face(face_bgr, pts_xy, scoring["scores"])
         overlay_hits_rgb = _bgr_to_rgb_uint8(overlay_hits)
 
