@@ -18,12 +18,34 @@ from .target_face import render_target_face_bgr
 
 CANON_SIZE = 900
 CANON_CENTER = (CANON_SIZE / 2.0, CANON_SIZE / 2.0)
-CANON_OUTER = CANON_SIZE * 0.45  # 405 px
+CANON_OUTER = CANON_SIZE * 0.45
 
 
 def _bgr_to_rgb_uint8(bgr: np.ndarray) -> np.ndarray:
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     return rgb.astype(np.uint8)
+
+
+def _safe_rgb_pil(img_rgb: np.ndarray | None) -> Image.Image | None:
+    """
+    streamlit_drawable_canvas expects a proper PIL.Image.
+    Guard against None / wrong dtype / wrong channel count.
+    """
+    if img_rgb is None:
+        return None
+    arr = np.asarray(img_rgb)
+    if arr.ndim != 3:
+        return None
+    if arr.shape[2] == 4:
+        arr = arr[:, :, :3]
+    if arr.shape[2] != 3:
+        return None
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    try:
+        return Image.fromarray(arr, mode="RGB")
+    except Exception:
+        return None
 
 
 def _points_to_initial_drawing(points, r=10):
@@ -64,14 +86,9 @@ def _draw_hits_on_face(face_bgr, points_xy, scores):
         if i < len(scores):
             s = scores[i]
             cv2.putText(
-                img,
-                str(s),
-                (px + 12, py - 12),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
+                img, str(s), (px + 12, py - 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                (255, 255, 255), 2, cv2.LINE_AA
             )
     return img
 
@@ -86,11 +103,14 @@ def render_analyze_step():
             t("distance", lang), min_value=3, max_value=90,
             value=int(st.session_state.distance_m), step=1
         )
+
     with top2:
+        # ✅ 下限 1
         st.session_state.arrows_per_end = st.number_input(
-            t("arrows", lang), min_value=3, max_value=12,
+            t("arrows", lang), min_value=1, max_value=12,
             value=int(st.session_state.arrows_per_end), step=1
         )
+
     with top3:
         face = st.selectbox(
             t("target_face", lang),
@@ -119,7 +139,7 @@ def render_analyze_step():
     file = st.file_uploader("", type=["png", "jpg", "jpeg"])
 
     if not file:
-        st.info("Upload → pose(rectify) → propose tips → refine contact → map to canonical → confirm → analyze")
+        st.info("Upload → pose(rectify) → propose → refine → map → confirm → analyze")
         return
 
     img_pil = Image.open(file).convert("RGB")
@@ -127,8 +147,10 @@ def render_analyze_step():
 
     cache_key = f"{getattr(file, 'name', 'upload')}-{img_rgb.shape[0]}x{img_rgb.shape[1]}"
     need = int(st.session_state.arrows_per_end)
+    distance_m = int(st.session_state.distance_m)
 
     if st.session_state.get("cv_cache_key") != cache_key:
+        # === CV pipeline (unchanged) ===
         rect_res = rectify_target(img_rgb, out_size=CANON_SIZE)
 
         face_bgr = render_target_face_bgr(
@@ -140,7 +162,6 @@ def render_analyze_step():
             ring_line_thickness=2,
         )
 
-        # 1) global candidates from arrow shafts / blobs
         coarse = propose_hit_points(
             rect_res.rect_bgr,
             rect_res.center_final,
@@ -148,7 +169,6 @@ def render_analyze_step():
             max_points=max(need, 12),
         )
 
-        # 2) refine -> contact point + face color estimate
         refined_rect_pts, contact_colors = refine_points_and_colors(
             rect_res.rect_bgr,
             target_center=rect_res.center_final,
@@ -157,7 +177,7 @@ def render_analyze_step():
             roi_radius=70,
         )
 
-        # de-dup refined points
+        # de-dup
         dedup = []
         dedup_cols = []
         min_d2 = 18.0 ** 2
@@ -171,7 +191,6 @@ def render_analyze_step():
                 dedup.append(p)
                 dedup_cols.append(col)
 
-        # 3) map to canonical using pose matrix (critical)
         auto_pts_canon = transform_points(dedup, rect_res.M_rect_to_canon)
 
         st.session_state.cv_cache_key = cache_key
@@ -193,14 +212,21 @@ def render_analyze_step():
     outer = st.session_state._geom_outer
 
     st.subheader(t("tap_points", lang))
-    st.caption("Pose first (midline/X + circle refine) → then contact points. Purple = hits.")
+    st.caption("Purple = hits. Confirm circles, then analyze.")
 
-    with st.expander("CV debug (pose + color)"):
+    with st.expander("CV debug"):
         st.write(st.session_state.warp_debug)
         st.image(st.session_state._rect_photo_rgb, caption="Rectified photo (debug)", use_column_width=False)
-        cols = st.session_state.get("auto_contact_colors", [])
-        if cols:
-            st.write({"contact_face_color_preview": cols[: min(10, len(cols))]})
+
+    # ---- ✅ critical fix: safe background image ----
+    bg_pil = _safe_rgb_pil(bg_rgb)
+    if bg_pil is None:
+        st.error("Background image is not ready (overlay_image_rgb is invalid). Click Clear and re-upload.")
+        st.write({"overlay_is_none": bg_rgb is None,
+                  "overlay_shape": None if bg_rgb is None else getattr(bg_rgb, "shape", None),
+                  "overlay_dtype": None if bg_rgb is None else getattr(bg_rgb, "dtype", None)})
+        return
+    # ---------------------------------------------
 
     initial = None
     if not st.session_state.points:
@@ -210,7 +236,7 @@ def render_analyze_step():
         fill_color="rgba(180, 0, 255, 0.22)",
         stroke_width=3,
         stroke_color="rgba(180, 0, 255, 0.95)",
-        background_image=Image.fromarray(bg_rgb),
+        background_image=bg_pil,
         update_streamlit=True,
         height=700,
         width=700,
@@ -239,9 +265,16 @@ def render_analyze_step():
         scoring = score_hits(center, outer, pts_xy)
         metrics = compute_metrics(points[:need])
         shape = classify_shape(metrics)
-        advice = next_end_advice(metrics, shape, st.session_state.handedness, lang=lang)
 
-        face_bgr = cv2.cvtColor(bg_rgb, cv2.COLOR_RGB2BGR)
+        advice = next_end_advice(
+            metrics, shape,
+            handedness=st.session_state.handedness,
+            distance_m=distance_m,
+            arrow_present=bool(st.session_state.warp_debug.get("arrow_present", False)) if st.session_state.warp_debug else False,
+            lang=lang,
+        )
+
+        face_bgr = cv2.cvtColor(np.array(bg_pil), cv2.COLOR_RGB2BGR)
         overlay_hits = _draw_hits_on_face(face_bgr, pts_xy, scoring["scores"])
         overlay_hits_rgb = _bgr_to_rgb_uint8(overlay_hits)
 
@@ -261,7 +294,7 @@ def render_analyze_step():
         advice = res["advice"]
 
         st.divider()
-        st.subheader("Overlay (standard face + hits + scores)")
+        st.subheader("Overlay")
         st.image(res["overlay_hits_rgb"], use_column_width=False)
 
         st.subheader("Score")
@@ -269,7 +302,7 @@ def render_analyze_step():
         st.write(f"- Avg: **{scoring['avg']:.2f}**")
         st.write(f"- Per arrow: {scoring['scores']}")
 
-        st.subheader("Grouping metrics (reference)")
+        st.subheader("Grouping metrics")
         st.write(f"- Shape: **{res['shape']}**")
         st.write(f"- Spread (avg): **{metrics['spread']:.1f} px**")
         st.write(f"- sx / sy: **{metrics['sx']:.1f} / {metrics['sy']:.1f}**")
@@ -278,8 +311,8 @@ def render_analyze_step():
         st.subheader("Next end cue")
         st.markdown(f"**{advice['title']}**")
         st.markdown(f"👉 {advice['cue']}")
-        with st.expander("Why"):
-            st.write(advice["why"])
+        with st.expander("Patterns (Art of Repetition)"):
+            st.markdown(advice["why"])
 
     if save_clicked:
         if not st.session_state.last_result:
