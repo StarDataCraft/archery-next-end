@@ -14,7 +14,7 @@ def render_handedness_step():
     )
     st.session_state.handedness = handed
 
-    col1, col2 = st.columns([1,1])
+    col1, col2 = st.columns([1, 1])
     with col1:
         if st.button(t("back", lang), use_container_width=True):
             goto_step("language")
