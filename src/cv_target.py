@@ -8,105 +8,203 @@ import cv2
 
 
 @dataclass
-class TargetWarpResult:
-    warped_bgr: np.ndarray
-    center: Tuple[float, float]          # in warped coords
-    radius: float                         # in warped coords
+class TargetRectifyResult:
+    rect_bgr: np.ndarray
+    center: Tuple[float, float]   # in rect coords
+    outer_radius: float           # in rect coords
+    arrow_present: bool
     debug: Dict[str, object]
 
 
-def _to_bgr(image_rgb: np.ndarray) -> np.ndarray:
-    # image_rgb: HxWx3 RGB uint8
-    return cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+def _rgb_to_bgr(rgb: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
 
-def detect_target_and_warp(image_rgb: np.ndarray, out_size: int = 900) -> TargetWarpResult:
+def _bgr_to_rgb(bgr: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+
+def _largest_contour(edge: np.ndarray) -> Optional[np.ndarray]:
+    contours, _ = cv2.findContours(edge, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    return contours[0]
+
+
+def _affine_rectify_by_ellipse(bgr: np.ndarray) -> Tuple[np.ndarray, Dict[str, object]]:
     """
-    High-ROI MVP warp:
-    - detect target circle (HoughCircles)
-    - crop a square around it
-    - resize to out_size x out_size
+    Fit ellipse to outer target boundary and apply an affine transform so that ellipse becomes closer to circle.
+    This handles most typical phone-angle distortions (mild perspective -> ellipse).
 
-    This is not full projective rectification, but it stabilizes scale + framing
-    and works well for typical phone photos with mild perspective.
+    Returns rectified_bgr (same size as input) and debug info.
     """
-    bgr = _to_bgr(image_rgb)
     h, w = bgr.shape[:2]
-
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    gray_blur = cv2.GaussianBlur(gray, (9, 9), 2)
+    gray = cv2.GaussianBlur(gray, (7, 7), 1.5)
+    edges = cv2.Canny(gray, 60, 140)
 
-    # Hough circle params are sensitive; these are reasonable defaults for archery targets.
+    cnt = _largest_contour(edges)
+    dbg: Dict[str, object] = {"ellipse_found": False}
+
+    if cnt is None or len(cnt) < 50:
+        return bgr.copy(), {"ellipse_found": False, "fallback": "no_contour"}
+
+    if len(cnt) < 5:
+        return bgr.copy(), {"ellipse_found": False, "fallback": "contour_too_small"}
+
+    ellipse = cv2.fitEllipse(cnt)
+    (cx, cy), (a, b), angle = ellipse  # axes lengths a,b; angle in degrees
+    # ensure a is major axis
+    major = max(a, b)
+    minor = min(a, b)
+    if minor < 1e-6:
+        return bgr.copy(), {"ellipse_found": False, "fallback": "minor_zero"}
+
+    dbg.update({
+        "ellipse_found": True,
+        "ellipse_center": (float(cx), float(cy)),
+        "ellipse_axes": (float(a), float(b)),
+        "ellipse_angle": float(angle),
+    })
+
+    # Rotate around center so major axis aligns with x-axis, then scale y to make minor -> major.
+    rot = cv2.getRotationMatrix2D((cx, cy), -angle, 1.0)  # 2x3
+    rotated = cv2.warpAffine(bgr, rot, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+    scale = major / minor
+    # Scale in y-direction around center after rotation (approx):
+    # y' = cy + scale*(y - cy)
+    # x' = x
+    S = np.array([[1.0, 0.0, 0.0],
+                  [0.0, scale, cy * (1.0 - scale)]], dtype=np.float32)
+
+    rect = cv2.warpAffine(rotated, S, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+    dbg["affine_scale_y"] = float(scale)
+    return rect, dbg
+
+
+def _refine_circle(bgr: np.ndarray) -> Tuple[Tuple[float, float], float, Dict[str, object]]:
+    """
+    Find the outer circle on rectified image via HoughCircles.
+    Fallback: use center of image.
+    """
+    h, w = bgr.shape[:2]
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (9, 9), 2)
+
     circles = cv2.HoughCircles(
-        gray_blur,
+        gray,
         cv2.HOUGH_GRADIENT,
         dp=1.2,
         minDist=min(h, w) * 0.2,
         param1=120,
         param2=35,
         minRadius=int(min(h, w) * 0.15),
-        maxRadius=int(min(h, w) * 0.48),
+        maxRadius=int(min(h, w) * 0.49),
     )
 
-    debug: Dict[str, object] = {"circle_found": False}
-
+    dbg: Dict[str, object] = {"circle_found": False}
     if circles is None:
-        # fallback: no warp, just resize whole image (still lets pipeline run)
-        warped = cv2.resize(bgr, (out_size, out_size), interpolation=cv2.INTER_AREA)
-        return TargetWarpResult(
-            warped_bgr=warped,
-            center=(out_size / 2, out_size / 2),
-            radius=min(out_size, out_size) * 0.45,
-            debug={"circle_found": False, "fallback": "resize_full_image"},
-        )
+        return (w / 2.0, h / 2.0), min(w, h) * 0.45, {"circle_found": False, "fallback": "no_hough"}
 
     circles = np.round(circles[0, :]).astype(int)
-
-    # pick the circle with largest radius (usually outer ring)
     circles = sorted(circles, key=lambda c: c[2], reverse=True)
     x, y, r = circles[0]
-    debug.update({"circle_found": True, "circle_xy_r": (int(x), int(y), int(r))})
+    dbg.update({"circle_found": True, "circle_xy_r": (int(x), int(y), int(r))})
+    return (float(x), float(y)), float(r), dbg
 
-    # crop square around circle with margin
-    margin = int(r * 0.12)
-    half = r + margin
 
-    x1 = max(0, x - half)
-    y1 = max(0, y - half)
-    x2 = min(w, x + half)
-    y2 = min(h, y + half)
+def _crop_square_around_circle(bgr: np.ndarray, center: Tuple[float, float], radius: float, out_size: int) -> Tuple[np.ndarray, Tuple[float, float], float]:
+    """
+    Crop a square around detected circle and resize to out_size.
+    """
+    h, w = bgr.shape[:2]
+    cx, cy = center
+
+    margin = int(radius * 0.10)
+    half = int(radius + margin)
+
+    x1 = max(0, int(cx) - half)
+    y1 = max(0, int(cy) - half)
+    x2 = min(w, int(cx) + half)
+    y2 = min(h, int(cy) + half)
 
     crop = bgr[y1:y2, x1:x2].copy()
     if crop.size == 0:
-        warped = cv2.resize(bgr, (out_size, out_size), interpolation=cv2.INTER_AREA)
-        return TargetWarpResult(
-            warped_bgr=warped,
-            center=(out_size / 2, out_size / 2),
-            radius=min(out_size, out_size) * 0.45,
-            debug={"circle_found": False, "fallback": "empty_crop_resize_full_image"},
-        )
+        resized = cv2.resize(bgr, (out_size, out_size), interpolation=cv2.INTER_AREA)
+        return resized, (out_size / 2.0, out_size / 2.0), min(out_size, out_size) * 0.45
 
-    warped = cv2.resize(crop, (out_size, out_size), interpolation=cv2.INTER_AREA)
-
-    # Map center/radius to warped coords
     crop_h, crop_w = crop.shape[:2]
+    resized = cv2.resize(crop, (out_size, out_size), interpolation=cv2.INTER_AREA)
+
     sx = out_size / crop_w
     sy = out_size / crop_h
+    new_cx = (cx - x1) * sx
+    new_cy = (cy - y1) * sy
+    new_r = radius * (sx + sy) / 2.0
+    return resized, (float(new_cx), float(new_cy)), float(new_r)
 
-    cx_w = (x - x1) * sx
-    cy_w = (y - y1) * sy
-    r_w = r * (sx + sy) / 2
 
-    return TargetWarpResult(
-        warped_bgr=warped,
-        center=(float(cx_w), float(cy_w)),
-        radius=float(r_w),
+def _detect_arrow_present(bgr: np.ndarray) -> Tuple[bool, int]:
+    """
+    Heuristic: if there are multiple long line segments, assume arrows are present.
+    """
+    h, w = bgr.shape[:2]
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 70, 160)
+
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=90,
+        minLineLength=int(min(h, w) * 0.18),
+        maxLineGap=12,
+    )
+    if lines is None:
+        return False, 0
+
+    # Count reasonably long lines
+    cnt = 0
+    for (x1, y1, x2, y2) in lines[:, 0, :]:
+        length = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+        if length >= min(h, w) * 0.22:
+            cnt += 1
+    return cnt >= 2, cnt
+
+
+def rectify_target(image_rgb: np.ndarray, out_size: int = 900) -> TargetRectifyResult:
+    """
+    Main entry:
+    - affine rectify via ellipse
+    - refine circle
+    - crop+resize to canonical square
+    - decide arrow-present
+    """
+    bgr = _rgb_to_bgr(image_rgb)
+
+    rect1, dbg1 = _affine_rectify_by_ellipse(bgr)
+    (cx, cy), r, dbg2 = _refine_circle(rect1)
+    rect2, (rcx, rcy), rr = _crop_square_around_circle(rect1, (cx, cy), r, out_size)
+
+    arrow_present, line_count = _detect_arrow_present(rect2)
+
+    debug = {}
+    debug.update(dbg1)
+    debug.update(dbg2)
+    debug.update({"arrow_present": arrow_present, "line_count": int(line_count)})
+    return TargetRectifyResult(
+        rect_bgr=rect2,
+        center=(rcx, rcy),
+        outer_radius=rr,
+        arrow_present=arrow_present,
         debug=debug,
     )
 
 
 def _dedupe_points(points: List[Tuple[float, float]], min_dist: float = 18.0) -> List[Tuple[float, float]]:
-    """Simple greedy NMS in point space."""
     kept: List[Tuple[float, float]] = []
     for (x, y) in points:
         ok = True
@@ -119,74 +217,106 @@ def _dedupe_points(points: List[Tuple[float, float]], min_dist: float = 18.0) ->
     return kept
 
 
-def _score_by_center_distance(
-    pts: List[Tuple[float, float]], center: Tuple[float, float]
-) -> List[Tuple[float, float]]:
+def _sort_by_center(points: List[Tuple[float, float]], center: Tuple[float, float]) -> List[Tuple[float, float]]:
     cx, cy = center
-    return sorted(pts, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
+    return sorted(points, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
 
 
 def propose_hit_points(
-    warped_bgr: np.ndarray,
+    rect_bgr: np.ndarray,
     center: Tuple[float, float],
+    arrow_present: bool,
     max_points: int = 12,
 ) -> List[Tuple[float, float]]:
     """
-    Traditional CV candidate hit-point proposal.
-    Mix two sources:
-    1) Dark small blobs (arrow holes / arrow tip region) via black-hat + blob detection
-    2) Line endpoints (arrow shafts) via HoughLinesP
-    Then dedupe + sort by closeness to center (usually shots cluster around center).
+    Two-branch candidate proposal:
+    - arrow_present: line endpoints -> choose endpoint closer to center
+    - no_arrow: black-hat blob detection for holes/dark marks
     """
-    h, w = warped_bgr.shape[:2]
-    gray = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2GRAY)
+    h, w = rect_bgr.shape[:2]
+    gray = cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2GRAY)
 
     candidates: List[Tuple[float, float]] = []
 
-    # --- Source 1: black-hat to highlight dark small spots
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19))
-    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+    if arrow_present:
+        edges = cv2.Canny(gray, 70, 160)
+        lines = cv2.HoughLinesP(
+            edges,
+            rho=1,
+            theta=np.pi / 180,
+            threshold=90,
+            minLineLength=int(min(h, w) * 0.18),
+            maxLineGap=14,
+        )
+        if lines is not None:
+            cx, cy = center
+            for (x1, y1, x2, y2) in lines[:, 0, :]:
+                # choose endpoint closer to center as "hit-side" endpoint
+                d1 = (x1 - cx) ** 2 + (y1 - cy) ** 2
+                d2 = (x2 - cx) ** 2 + (y2 - cy) ** 2
+                if d1 < d2:
+                    candidates.append((float(x1), float(y1)))
+                else:
+                    candidates.append((float(x2), float(y2)))
 
-    # normalize + threshold
-    bh = cv2.normalize(blackhat, None, 0, 255, cv2.NORM_MINMAX)
-    _, th = cv2.threshold(bh, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    else:
+        # black-hat for dark small blobs (holes)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19))
+        blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+        bh = cv2.normalize(blackhat, None, 0, 255, cv2.NORM_MINMAX)
+        _, th = cv2.threshold(bh, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        th = cv2.medianBlur(th, 5)
 
-    # remove tiny noise
-    th = cv2.medianBlur(th, 5)
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(th, connectivity=8)
+        for i in range(1, num_labels):
+            x, y, ww, hh, area = stats[i]
+            if area < 25 or area > 1800:
+                continue
+            cx, cy = centroids[i]
+            if cx < 10 or cy < 10 or cx > w - 10 or cy > h - 10:
+                continue
+            candidates.append((float(cx), float(cy)))
 
-    # connected components as blob candidates
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(th, connectivity=8)
-    for i in range(1, num_labels):
-        x, y, ww, hh, area = stats[i]
-        if area < 25 or area > 2000:
-            continue
-        cx, cy = centroids[i]
-        # filter out borders
-        if cx < 10 or cy < 10 or cx > w - 10 or cy > h - 10:
-            continue
-        candidates.append((float(cx), float(cy)))
-
-    # --- Source 2: arrow shaft line endpoints (helps when holes are unclear)
-    edges = cv2.Canny(gray, 70, 150)
-    lines = cv2.HoughLinesP(
-        edges,
-        rho=1,
-        theta=np.pi / 180,
-        threshold=80,
-        minLineLength=int(min(h, w) * 0.10),
-        maxLineGap=12,
-    )
-
-    if lines is not None:
-        for line in lines[:, 0, :]:
-            x1, y1, x2, y2 = map(int, line)
-            # take both endpoints; later dedupe will remove overlaps
-            candidates.append((float(x1), float(y1)))
-            candidates.append((float(x2), float(y2)))
-
-    # Dedupe and keep the most plausible ones near center first
     candidates = _dedupe_points(candidates, min_dist=20.0)
-    candidates = _score_by_center_distance(candidates, center)
-
-    # Keep top-N
+    candidates = _sort_by_center(candidates, center)
     return candidates[:max_points]
+
+
+def draw_overlay(
+    rect_bgr: np.ndarray,
+    center: Tuple[float, float],
+    ring_radii: List[float],
+    points_xy: List[Tuple[float, float]],
+    scores: List[int],
+) -> np.ndarray:
+    """
+    Draw ring circles + hit points + per-hit score.
+    """
+    overlay = rect_bgr.copy()
+    cx, cy = int(center[0]), int(center[1])
+
+    # rings
+    for r in ring_radii:
+        cv2.circle(overlay, (cx, cy), int(r), (0, 255, 255), 2)  # yellow-ish
+
+    # center mark
+    cv2.circle(overlay, (cx, cy), 4, (0, 255, 255), -1)
+
+    # hits
+    for i, (x, y) in enumerate(points_xy):
+        px, py = int(x), int(y)
+        cv2.circle(overlay, (px, py), 9, (255, 0, 0), 2)  # blue circle
+        s = scores[i] if i < len(scores) else None
+        if s is not None:
+            cv2.putText(
+                overlay,
+                str(s),
+                (px + 10, py - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+    return overlay
