@@ -2,7 +2,6 @@ import streamlit as st
 from PIL import Image
 import numpy as np
 import cv2
-
 from streamlit_drawable_canvas import st_canvas
 
 from .i18n import t
@@ -18,7 +17,7 @@ from .target_face import render_target_face_bgr
 
 CANON_SIZE = 900
 CANON_CENTER = (CANON_SIZE / 2.0, CANON_SIZE / 2.0)
-CANON_OUTER = CANON_SIZE * 0.45
+CANON_OUTER = CANON_SIZE * 0.45  # 405 px
 
 
 def _bgr_to_rgb_uint8(bgr: np.ndarray) -> np.ndarray:
@@ -34,8 +33,8 @@ def _points_to_initial_drawing(points, r=10):
             "left": float(x - r),
             "top": float(y - r),
             "radius": float(r),
-            "fill": "rgba(180, 0, 255, 0.22)",
-            "stroke": "rgba(180, 0, 255, 0.95)",
+            "fill": "rgba(180, 0, 255, 0.22)",          # purple fill
+            "stroke": "rgba(180, 0, 255, 0.95)",        # purple stroke
             "strokeWidth": 2,
         })
     return {"version": "4.4.0", "objects": objects}
@@ -56,15 +55,17 @@ def _extract_points_from_canvas(json_data: dict):
 
 def _draw_hits_on_face(face_bgr, points_xy, scores):
     img = face_bgr.copy()
-    PURPLE = (255, 0, 255)
+    PURPLE = (255, 0, 255)  # BGR
     for i, (x, y) in enumerate(points_xy):
         px, py = int(round(x)), int(round(y))
         cv2.circle(img, (px, py), 10, PURPLE, 2)
         cv2.circle(img, (px, py), 2, PURPLE, -1)
         if i < len(scores):
             s = scores[i]
-            cv2.putText(img, str(s), (px + 12, py - 12),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(
+                img, str(s), (px + 12, py - 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA
+            )
     return img
 
 
@@ -78,14 +79,12 @@ def render_analyze_step():
             t("distance", lang), min_value=3, max_value=90,
             value=int(st.session_state.distance_m), step=1
         )
-
     with top2:
-        # ✅ 下限从 3 → 1
+        # ✅ 下限从 3 放松到 1
         st.session_state.arrows_per_end = st.number_input(
             t("arrows", lang), min_value=1, max_value=12,
             value=int(st.session_state.arrows_per_end), step=1
         )
-
     with top3:
         face = st.selectbox(
             t("target_face", lang),
@@ -152,16 +151,10 @@ def render_analyze_step():
         )
 
         # de-dup
-        dedup = []
-        dedup_cols = []
+        dedup, dedup_cols = [], []
         min_d2 = 18.0 ** 2
         for p, col in zip(refined_rect_pts, contact_colors):
-            ok = True
-            for q in dedup:
-                if (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 < min_d2:
-                    ok = False
-                    break
-            if ok:
+            if all((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 >= min_d2 for q in dedup):
                 dedup.append(p)
                 dedup_cols.append(col)
 
@@ -176,21 +169,21 @@ def render_analyze_step():
 
         st.session_state._geom_center = CANON_CENTER
         st.session_state._geom_outer = CANON_OUTER
-
         st.session_state._rect_photo_rgb = _bgr_to_rgb_uint8(rect_res.rect_bgr)
         st.session_state.warp_debug = rect_res.debug
 
     bg_rgb = st.session_state.overlay_image_rgb
     auto_pts = st.session_state.auto_points
-    center = st.session_state._geom_center
-    outer = st.session_state._geom_outer
 
     st.subheader(t("tap_points", lang))
-    st.caption("Purple = hits. Confirm circles, then analyze.")
+    st.caption("Purple circles = hits. You can drag/resize to correct.")
 
     with st.expander("CV debug"):
         st.write(st.session_state.warp_debug)
         st.image(st.session_state._rect_photo_rgb, caption="Rectified photo (debug)", use_column_width=False)
+        cols = st.session_state.get("auto_contact_colors", [])
+        if cols:
+            st.write({"contact_face_color_preview": cols[: min(10, len(cols))]})
 
     initial = None
     if not st.session_state.points:
@@ -226,16 +219,16 @@ def render_analyze_step():
 
         pts_xy = [(p["x"], p["y"]) for p in points[:need]]
 
-        scoring = score_hits(center, outer, pts_xy)
+        scoring = score_hits(st.session_state._geom_center, st.session_state._geom_outer, pts_xy)
         metrics = compute_metrics(points[:need])
         shape = classify_shape(metrics)
 
-        # ✅ 文本增强（pattern 检索），并严格使用当前 lang
         advice = next_end_advice(
-            metrics, shape,
+            metrics=metrics,
+            shape=shape,
             handedness=st.session_state.handedness,
             distance_m=distance_m,
-            arrow_present=bool(st.session_state.warp_debug.get("arrow_present", False)) if st.session_state.warp_debug else False,
+            arrow_present=bool(st.session_state.warp_debug.get("arrow_present", False)),
             lang=lang,
         )
 
@@ -257,17 +250,19 @@ def render_analyze_step():
         metrics = res["metrics"]
         scoring = res["scoring"]
         advice = res["advice"]
+        need_now = int(st.session_state.arrows_per_end)
 
         st.divider()
-        st.subheader("Overlay")
+        st.subheader("Overlay (standard face + hits + scores)")
         st.image(res["overlay_hits_rgb"], use_column_width=False)
 
         st.subheader("Score")
-        st.write(f"- Total: **{scoring['total']}** / {need * 10}")
+        st.write(f"- Total: **{scoring['total']}** / {need_now * 10}")
         st.write(f"- Avg: **{scoring['avg']:.2f}**")
         st.write(f"- Per arrow: {scoring['scores']}")
 
         st.subheader("Grouping metrics")
+        st.write(f"- n: **{int(metrics.get('n', 0))}**")
         st.write(f"- Shape: **{res['shape']}**")
         st.write(f"- Spread (avg): **{metrics['spread']:.1f} px**")
         st.write(f"- sx / sy: **{metrics['sx']:.1f} / {metrics['sy']:.1f}**")
@@ -276,8 +271,8 @@ def render_analyze_step():
         st.subheader("Next end cue")
         st.markdown(f"**{advice['title']}**")
         st.markdown(f"👉 {advice['cue']}")
-        with st.expander("Patterns (Art of Repetition)"):
-            st.markdown(advice["why"])
+        with st.expander("Patterns (from training heuristics)"):
+            st.write(advice["why"])
 
     if save_clicked:
         if not st.session_state.last_result:
