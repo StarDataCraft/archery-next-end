@@ -26,28 +26,6 @@ def _bgr_to_rgb_uint8(bgr: np.ndarray) -> np.ndarray:
     return rgb.astype(np.uint8)
 
 
-def _safe_rgb_pil(img_rgb: np.ndarray | None) -> Image.Image | None:
-    """
-    streamlit_drawable_canvas expects a proper PIL.Image.
-    Guard against None / wrong dtype / wrong channel count.
-    """
-    if img_rgb is None:
-        return None
-    arr = np.asarray(img_rgb)
-    if arr.ndim != 3:
-        return None
-    if arr.shape[2] == 4:
-        arr = arr[:, :, :3]
-    if arr.shape[2] != 3:
-        return None
-    if arr.dtype != np.uint8:
-        arr = np.clip(arr, 0, 255).astype(np.uint8)
-    try:
-        return Image.fromarray(arr, mode="RGB")
-    except Exception:
-        return None
-
-
 def _points_to_initial_drawing(points, r=10):
     objects = []
     for (x, y) in points:
@@ -78,18 +56,15 @@ def _extract_points_from_canvas(json_data: dict):
 
 def _draw_hits_on_face(face_bgr, points_xy, scores):
     img = face_bgr.copy()
-    PURPLE = (255, 0, 255)  # BGR
+    PURPLE = (255, 0, 255)
     for i, (x, y) in enumerate(points_xy):
         px, py = int(round(x)), int(round(y))
         cv2.circle(img, (px, py), 10, PURPLE, 2)
         cv2.circle(img, (px, py), 2, PURPLE, -1)
         if i < len(scores):
             s = scores[i]
-            cv2.putText(
-                img, str(s), (px + 12, py - 12),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                (255, 255, 255), 2, cv2.LINE_AA
-            )
+            cv2.putText(img, str(s), (px + 12, py - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
     return img
 
 
@@ -105,7 +80,7 @@ def render_analyze_step():
         )
 
     with top2:
-        # ✅ 下限 1
+        # ✅ 下限从 3 → 1
         st.session_state.arrows_per_end = st.number_input(
             t("arrows", lang), min_value=1, max_value=12,
             value=int(st.session_state.arrows_per_end), step=1
@@ -139,7 +114,7 @@ def render_analyze_step():
     file = st.file_uploader("", type=["png", "jpg", "jpeg"])
 
     if not file:
-        st.info("Upload → pose(rectify) → propose → refine → map → confirm → analyze")
+        st.info("Upload → pose(rectify) → propose tips → refine contact → map → confirm → analyze")
         return
 
     img_pil = Image.open(file).convert("RGB")
@@ -150,7 +125,6 @@ def render_analyze_step():
     distance_m = int(st.session_state.distance_m)
 
     if st.session_state.get("cv_cache_key") != cache_key:
-        # === CV pipeline (unchanged) ===
         rect_res = rectify_target(img_rgb, out_size=CANON_SIZE)
 
         face_bgr = render_target_face_bgr(
@@ -218,16 +192,6 @@ def render_analyze_step():
         st.write(st.session_state.warp_debug)
         st.image(st.session_state._rect_photo_rgb, caption="Rectified photo (debug)", use_column_width=False)
 
-    # ---- ✅ critical fix: safe background image ----
-    bg_pil = _safe_rgb_pil(bg_rgb)
-    if bg_pil is None:
-        st.error("Background image is not ready (overlay_image_rgb is invalid). Click Clear and re-upload.")
-        st.write({"overlay_is_none": bg_rgb is None,
-                  "overlay_shape": None if bg_rgb is None else getattr(bg_rgb, "shape", None),
-                  "overlay_dtype": None if bg_rgb is None else getattr(bg_rgb, "dtype", None)})
-        return
-    # ---------------------------------------------
-
     initial = None
     if not st.session_state.points:
         initial = _points_to_initial_drawing(auto_pts[:need], r=10)
@@ -236,7 +200,7 @@ def render_analyze_step():
         fill_color="rgba(180, 0, 255, 0.22)",
         stroke_width=3,
         stroke_color="rgba(180, 0, 255, 0.95)",
-        background_image=bg_pil,
+        background_image=Image.fromarray(bg_rgb),
         update_streamlit=True,
         height=700,
         width=700,
@@ -266,6 +230,7 @@ def render_analyze_step():
         metrics = compute_metrics(points[:need])
         shape = classify_shape(metrics)
 
+        # ✅ 文本增强（pattern 检索），并严格使用当前 lang
         advice = next_end_advice(
             metrics, shape,
             handedness=st.session_state.handedness,
@@ -274,7 +239,7 @@ def render_analyze_step():
             lang=lang,
         )
 
-        face_bgr = cv2.cvtColor(np.array(bg_pil), cv2.COLOR_RGB2BGR)
+        face_bgr = cv2.cvtColor(bg_rgb, cv2.COLOR_RGB2BGR)
         overlay_hits = _draw_hits_on_face(face_bgr, pts_xy, scoring["scores"])
         overlay_hits_rgb = _bgr_to_rgb_uint8(overlay_hits)
 
