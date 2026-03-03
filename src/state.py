@@ -14,7 +14,7 @@ def init_state():
     if "distance_m" not in st.session_state:
         st.session_state.distance_m = 18
 
-    # 默认仍给 3，但 UI 下限已放松为 1
+    # ✅ 默认仍为 3，但下限允许 1
     if "arrows_per_end" not in st.session_state:
         st.session_state.arrows_per_end = 3
 
