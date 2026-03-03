@@ -26,8 +26,7 @@ def _cos(a: Dict[str, float], b: Dict[str, float]) -> float:
     nb = 0.0
     for k, va in a.items():
         na += va * va
-        vb = b.get(k, 0.0)
-        dot += va * vb
+        dot += va * b.get(k, 0.0)
     for vb in b.values():
         nb += vb * vb
     if na <= 1e-9 or nb <= 1e-9:
@@ -47,70 +46,87 @@ def _bow_vec(tokens: List[str]) -> Dict[str, float]:
     return v
 
 
-# 说明：
-# 这些条目是把书中反复强调的“可复现的训练/诊断模式”抽象成可检索的 pattern。
+# 说明：这里不是逐字引用书，而是把书里反复出现的“观察 → 归因 → 行动”训练思路做成可检索 pattern。
 KB: List[PatternItem] = [
     PatternItem(
-        key="repeatable_shot_over_fancy",
-        query="repeatable shot boring repeat process not chasing",
+        key="repeat_same_shot",
+        query="repeat same shot process same setup routine rhythm boring repeatability",
         texts={
-            "en": "Make the shot repeatable before you make it fancy. If you can’t repeat it, you can’t trust the feedback.",
-            "ja": "派手さより再現性。繰り返せない動作は、フィードバックの信用が落ちる。",
-            "zh": "先要可重复，再谈高级。做不到重复，反馈就不可信。",
+            "en": "Make it boring: repeat the same setup and execution. Don’t ‘try harder’—repeat better.",
+            "ja": "退屈でいい：同じセットアップと動作を繰り返す。「頑張る」より「再現する」。",
+            "zh": "越无聊越有效：重复同一套动作。别“更用力”，要“更可重复”。",
         },
     ),
     PatternItem(
-        key="log_to_find_patterns",
-        query="training log record patterns distance changes what changed",
+        key="one_change_rule",
+        query="one change at a time isolate variable avoid changing many things",
         texts={
-            "en": "Keep a simple log (distance, notes, what changed). Patterns show up faster than memory.",
-            "ja": "距離・メモ・変えた点をログ化。記憶より早くパターンが見える。",
-            "zh": "做简单日志（距离、备注、改了什么）。比靠记忆更快看规律。",
+            "en": "Change one thing at a time. If you change two, you learn nothing.",
+            "ja": "変えるのは1つだけ。2つ変えたら、何が効いたか分からない。",
+            "zh": "一次只改一件事。两件一起改，你学不到原因。",
         },
     ),
     PatternItem(
-        key="clearance_first_short_distance",
-        query="short distance group big clearance string chest arm rest button contact",
+        key="short_distance_big_group_clearance",
+        query="group larger at short distance clearance string chest arm contact rest button",
         texts={
-            "en": "If groups blow up at short distance, suspect clearance first (string/arm/chest, fletch hitting rest/button). Fix clearance before tune-chasing.",
-            "ja": "短距離で急に散るなら、まずクリアランス（弦/腕/胸、羽がレスト/ボタン接触）を疑う。チューン前に解決。",
-            "zh": "短距离反而更散，先查清弦（弦/护臂/胸）与羽碰rest/button。先修清弦再调弓。",
+            "en": "If groups blow up at short distance, suspect clearance first: string on chest/arm or fletch catching rest/button.",
+            "ja": "短距離で散るなら、まずクリアランス疑い。弦が胸/腕に当たる、羽がレスト/ボタンに触れる。",
+            "zh": "短距离更散，先怀疑清弦：弦碰胸/护臂，或羽碰rest/button。",
         },
     ),
     PatternItem(
-        key="long_distance_drift",
-        query="long distance group grows drift slow down arrow speed foc point weight fletch",
+        key="long_distance_big_group_speed_drift",
+        query="group larger at long distance arrow slowing drift point weight foc fletch helical",
         texts={
-            "en": "If the group grows disproportionately at long distance, think drift/slowdown: point weight (FOC) and ‘too much stabilizing’ fletch can cost speed.",
-            "ja": "長距離でだけ散るなら失速/ドリフト。ポイント重量(FOC)や効きすぎる羽設定で速度を落としていないか。",
-            "zh": "长距离才散，多半是失速/飘：点重与FOC、羽角/羽太“稳但掉速”要检查。",
+            "en": "If long distance opens up disproportionately, think speed/drift: check point weight (FOC) and fletch setup that bleeds speed.",
+            "ja": "長距離で急に散るなら失速/ドリフト。ポイント重量(FOC)と効きすぎる羽角で速度を落としていないか。",
+            "zh": "长距离散得多，考虑失速/飘：检查点重/FOC，以及羽角太大导致掉速。",
         },
     ),
     PatternItem(
-        key="same_shot_all_distances",
+        key="same_shot_all_distances_hip_tilt",
         query="same shot all distances hip tilt keep shoulder arm torso relationship",
         texts={
-            "en": "Don’t learn a different shot per distance. Keep shoulder–arm–torso relationship; adjust elevation mainly by tilting from the hips.",
-            "ja": "距離ごとに別フォームにしない。肩・腕・体幹の関係は固定し、角度は主に腰（ヒップ）から作る。",
-            "zh": "不要不同距离练成不同动作。肩-臂-躯干关系固定，主要用髋部倾斜调整仰角。",
+            "en": "Don’t learn a different shot per distance. Keep shoulder–arm–torso relationships; adjust elevation mainly from the hips.",
+            "ja": "距離ごとに別の動作を作らない。肩・腕・体幹は一定で、主に腰（ヒップ）から傾ける。",
+            "zh": "别把不同距离练成不同动作。保持肩-臂-躯干关系不变，主要用髋部倾斜调仰角。",
         },
     ),
     PatternItem(
-        key="wind_strategy",
-        query="wind steady move sight chaotic observe flags short cycles",
+        key="log_patterns",
+        query="training log record changes conditions find patterns faster than memory",
         texts={
-            "en": "In steady wind, moving sight can be cleaner than forcing a hold. In chaotic wind, read flags and shoot in short observation cycles.",
-            "ja": "一定風ならサイト移動で保持を揃える方が楽。乱風なら旗を見て短い観察サイクルで撃つ。",
-            "zh": "稳定风可用移动瞄准替代硬扛。乱风看旗，缩短观察周期再出箭。",
+            "en": "Keep a simple log (distance, hits, what you changed, fatigue). Patterns show up faster than ‘memory’.",
+            "ja": "簡単なログを残す（距離、着弾、変えたこと、疲労）。記憶より早くパターンが見える。",
+            "zh": "保持简单日志（距离、落点、改了什么、疲劳）。比靠记忆更快看出规律。",
         },
     ),
     PatternItem(
-        key="nock_consistency",
-        query="nock fit consistency changes grouping tune even color",
+        key="wind_reading",
+        query="wind steady move sight chaotic wind observe flags short cycles",
         texts={
-            "en": "Nock fit consistency matters. Even changing nock type/color can shift grouping—keep it consistent and recheck when you change.",
-            "ja": "ノックのフィットは重要。種類/色変更でもグルーピングが変わることがある。揃えて、変えたら再確認。",
-            "zh": "卡扣一致性很重要。换型号/颜色都可能影响分组，尽量统一；换了就复查。",
+            "en": "In steady wind, moving sight can be cleaner. In chaotic wind, rely on flags and shorter observation cycles.",
+            "ja": "一定の風ならサイト移動で保持を揃える。乱れる風は旗を見て、短い観察サイクルで読む。",
+            "zh": "稳定风可直接移动瞄准。风乱就看旗，缩短观察周期再出箭。",
+        },
+    ),
+    PatternItem(
+        key="nock_fit_consistency",
+        query="nock fit consistency affects grouping tune recheck after change",
+        texts={
+            "en": "Nock fit consistency matters. If you change nocks, recheck grouping/tune.",
+            "ja": "ノックのフィットは重要。変えたらグループ/チューンを再確認。",
+            "zh": "卡扣一致性很关键。换了卡扣要复查分组/调性。",
+        },
+    ),
+    PatternItem(
+        key="front_side_clean",
+        query="front side clean bow shoulder stable no collapse alignment bone to bone",
+        texts={
+            "en": "Aim for a ‘quiet’ front side: stable bow shoulder, no collapse, bone alignment doing the holding.",
+            "ja": "フロント側を静かに：弓肩は安定、潰れない。骨格アライメントで支える。",
+            "zh": "让前侧“安静”：弓肩稳定、不塌。靠骨架对齐在撑，而不是靠硬顶。",
         },
     ),
 ]
