@@ -7,6 +7,7 @@ from src.ui_analyze import render_analyze_step
 
 st.set_page_config(page_title="Archery Next End Coach", layout="wide")
 
+
 def main():
     init_state()
 
@@ -19,9 +20,9 @@ def main():
     elif step == "analyze":
         render_analyze_step()
     else:
-        # fallback
         goto_step("language")
         st.rerun()
+
 
 if __name__ == "__main__":
     main()
