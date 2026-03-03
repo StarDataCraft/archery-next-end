@@ -1,4 +1,6 @@
 # src/ui_analyze.py
+from __future__ import annotations
+
 import streamlit as st
 from PIL import Image
 import numpy as np
@@ -14,6 +16,9 @@ from .cv_target import rectify_target, transform_points, propose_hit_points
 from .refine_points import refine_points_and_colors, sample_contact_color_hsv
 from .scoring import score_hits_color_aware
 from .target_face import render_target_face_bgr
+
+# NEW: flexible coach (RAG / local LLM)
+from .coach import CoachRAG, CoachConfig
 
 CANON_SIZE = 900
 CANON_CENTER = (CANON_SIZE / 2.0, CANON_SIZE / 2.0)
@@ -133,6 +138,35 @@ def render_analyze_step():
             st.session_state.last_result = None
             st.session_state.overlay_image_rgb = None
 
+    # ------------------------------------------------------------------
+    # (A) NEW: Coach settings (flexible text via book PDF on GitHub)
+    # ------------------------------------------------------------------
+    with st.expander("Coaching (flexible text)"):
+        # Ensure defaults exist even if state.py not yet updated
+        if "coach_mode" not in st.session_state:
+            st.session_state.coach_mode = "rag"
+        if "coach_pdf_path" not in st.session_state:
+            st.session_state.coach_pdf_path = "docs/Archery_The_Art_of_Repetition.pdf"
+        if "coach_gguf_path" not in st.session_state:
+            st.session_state.coach_gguf_path = "models/llm.gguf"
+
+        st.session_state.coach_mode = st.selectbox(
+            "Mode",
+            options=["rules", "rag", "rag_llm"],
+            index=["rules", "rag", "rag_llm"].index(st.session_state.coach_mode),
+            help="rules: fixed template; rag: book-guided retrieval; rag_llm: retrieval + local GGUF model",
+        )
+        st.session_state.coach_pdf_path = st.text_input(
+            "PDF path in repo",
+            value=st.session_state.coach_pdf_path,
+            help="Example: docs/Archery_The_Art_of_Repetition.pdf",
+        )
+        st.session_state.coach_gguf_path = st.text_input(
+            "Local GGUF (optional)",
+            value=st.session_state.coach_gguf_path,
+            help="Used only when mode=rag_llm, e.g. models/llm.gguf",
+        )
+
     colA, colB = st.columns([1, 1])
     with colA:
         if st.button(t("back", lang), use_container_width=True):
@@ -248,31 +282,53 @@ def render_analyze_step():
 
             pts_xy = [(p["x"], p["y"]) for p in points[:need]]
 
+            # ---- color-aware scoring: map canonical points back to rectified photo, sample HSV there ----
             rect_bgr = st.session_state._rect_photo_bgr
             M_rect_to_canon = st.session_state._M_rect_to_canon
-
             rect_pts = _canon_to_rect_points(pts_xy, M_rect_to_canon)
 
             hsvs = []
-            for rp in rect_pts:
-                try:
-                    hsv = sample_contact_color_hsv(rect_bgr, rp, roi_radius=18)
-                except TypeError:
-                    hsv = sample_contact_color_hsv(rect_bgr, rp[0], rp[1], r=10)
-                hsvs.append(hsv)
+            for (rx, ry) in rect_pts:
+                hsv = sample_contact_color_hsv(rect_bgr, (rx, ry), roi_radius=18)
+                if hsv is None:
+                    hsvs.append(None)
+                else:
+                    hsvs.append(hsv)
 
             scoring = score_hits_color_aware(center, outer, pts_xy, contact_hsvs=hsvs)
 
             metrics = compute_metrics(points[:need], center=center, outer_radius_px=outer)
             shape = classify_shape(metrics)
 
-            advice = next_end_advice(
+            # ------------------------------------------------------------------
+            # (B) NEW: base advice from rules -> enhance via RAG / optional LLM
+            # ------------------------------------------------------------------
+            base_advice = next_end_advice(
                 metrics,
                 shape,
                 st.session_state.handedness,
                 lang=lang,
                 quality=quality,
             )
+
+            cfg = CoachConfig(
+                pdf_path=st.session_state.coach_pdf_path,
+                mode=st.session_state.coach_mode,
+                gguf_path=st.session_state.coach_gguf_path,
+            )
+            coach = CoachRAG(cfg)
+
+            try:
+                advice = coach.enhance_advice(
+                    base_advice=base_advice,
+                    metrics=metrics,
+                    shape=shape,
+                    handedness=st.session_state.handedness,
+                    lang=lang,
+                )
+            except Exception as e:
+                advice = dict(base_advice)
+                advice["rag_error"] = str(e)
 
             face_bgr = cv2.cvtColor(bg_rgb, cv2.COLOR_RGB2BGR)
             overlay_hits = _draw_hits_on_face(face_bgr, pts_xy, scoring["scores"])
@@ -304,7 +360,7 @@ def render_analyze_step():
 
         st.divider()
         st.subheader("Overlay (standard face + hits + scores)")
-        st.image(res["overlay_hits_rgb"], use_column_width=False)
+        st.image(res["overlay_hits_rgb"], use_container_width=False)
 
         st.subheader("Score (color-aware)")
         st.write(f"- Total: **{scoring['total']}** / {need * 10}")
@@ -322,34 +378,51 @@ def render_analyze_step():
         if quality is not None:
             st.write(f"- CV quality: **{float(quality.get('score', 1.0)):.2f}** ({quality.get('flags', [])})")
 
-        # -----------------------------
-        # NEW: repetition-first coaching block
-        # -----------------------------
-        st.subheader("Next end coaching (repetition-first)")
-        st.markdown(f"**{advice.get('title','')}**")
+        # ------------------------------------------------------------------
+        # (C) NEW: display advice fields (rules-compatible + rag-enhanced)
+        # ------------------------------------------------------------------
+        st.subheader("Next end coaching (flexible)")
+        st.markdown(f"**{advice.get('title', '')}**")
 
-        # 1) One cue
-        st.markdown(f"**One cue**: {advice.get('single_cue', advice.get('cue',''))}")
+        # Prefer enhanced fields; fall back to old keys if needed
+        single_cue = advice.get("single_cue", advice.get("cue", ""))
+        pass_fail = advice.get("pass_fail", "")
+        fallback = advice.get("fallback", "")
+        mental = advice.get("mental_phrase", "")
+        script = advice.get("script", "")
 
-        # 2) PASS/FAIL
-        st.markdown(f"**PASS/FAIL**: {advice.get('pass_fail','')}")
+        if single_cue:
+            st.markdown(f"**One cue**: {single_cue}")
+        if pass_fail:
+            st.markdown(f"**PASS/FAIL**: {pass_fail}")
+        if fallback:
+            st.markdown(f"**If it breaks**: {fallback}")
 
-        # 3) Fallback
-        st.markdown(f"**If it breaks**: {advice.get('fallback','')}")
-
-        # 4) Immediate drill
         drill = advice.get("drill", {}) or {}
-        if drill:
-            st.markdown(f"**Immediate drill ({drill.get('duration_s','?')}s)**: {drill.get('name','')}")
-            st.markdown(drill.get("how", ""))
+        if isinstance(drill, dict) and drill:
+            dur = drill.get("duration_s", None)
+            name = drill.get("name", "")
+            how = drill.get("how", "")
+            if name:
+                if dur is not None:
+                    st.markdown(f"**Immediate drill ({dur}s)**: {name}")
+                else:
+                    st.markdown(f"**Immediate drill**: {name}")
+            if how:
+                st.markdown(how)
 
-        # 5) Mental phrase
-        st.markdown(f"**Mental phrase**: {advice.get('mental_phrase','')}")
+        if mental:
+            st.markdown(f"**Mental phrase**: {mental}")
 
-        # 6) Script (compact)
-        with st.expander("Shot Script (compact)"):
-            st.code(advice.get("script", ""), language="text")
-            st.write({"stage": advice.get("stage"), "tag": advice.get("tag"), "principle": advice.get("principle")})
+        if script:
+            with st.expander("Shot Script (compact)"):
+                st.code(script, language="text")
+
+        # RAG debug (if present)
+        with st.expander("RAG debug"):
+            st.write(advice.get("rag", None))
+            if "rag_error" in advice:
+                st.warning(advice["rag_error"])
 
     if save_clicked:
         if not st.session_state.last_result:
