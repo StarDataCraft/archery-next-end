@@ -1,28 +1,32 @@
+# src/cv_target.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional
-
 import numpy as np
 import cv2
 
 
 @dataclass
 class TargetRectifyResult:
-    rect_bgr: np.ndarray                 # rectified photo (square)
-    circle_center: Tuple[float, float]   # center from circle (rect coords)
-    outer_radius: float                  # outer radius (rect coords)
+    rect_bgr: np.ndarray  # rectified photo (square)
+    circle_center: Tuple[float, float]  # center from circle (rect coords)
+    outer_radius: float  # outer radius (rect coords)
 
     # refined pose
-    midline_y: Optional[float]           # detected horizontal midline y in rect coords (after midline rotation)
+    midline_y: Optional[float]  # detected horizontal midline y in rect coords (after midline rotation)
     x_center: Optional[Tuple[float, float]]  # detected X center if found
-    center_final: Tuple[float, float]    # final center (X if found else circle center)
+    center_final: Tuple[float, float]  # final center (X if found else circle center)
 
     # mapping from rect coords -> canonical coords (900x900)
-    M_rect_to_canon: np.ndarray          # 2x3 float32 similarity transform
+    M_rect_to_canon: np.ndarray  # 2x3 float32 similarity transform
 
     arrow_present: bool
     debug: Dict[str, object]
+
+    # NEW: quality summary
+    quality_score: float
+    quality_flags: List[str]
 
 
 CANON_SIZE = 900
@@ -49,13 +53,11 @@ def _affine_rectify_by_ellipse(bgr: np.ndarray) -> Tuple[np.ndarray, Dict[str, o
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (7, 7), 1.5)
     edges = cv2.Canny(gray, 60, 140)
-
     cnt = _largest_contour(edges)
-    dbg: Dict[str, object] = {"ellipse_found": False}
 
+    dbg: Dict[str, object] = {"ellipse_found": False}
     if cnt is None or len(cnt) < 50:
         return bgr.copy(), {"ellipse_found": False, "fallback": "no_contour"}
-
     if len(cnt) < 5:
         return bgr.copy(), {"ellipse_found": False, "fallback": "contour_too_small"}
 
@@ -66,21 +68,27 @@ def _affine_rectify_by_ellipse(bgr: np.ndarray) -> Tuple[np.ndarray, Dict[str, o
     if minor < 1e-6:
         return bgr.copy(), {"ellipse_found": False, "fallback": "minor_zero"}
 
-    dbg.update({
-        "ellipse_found": True,
-        "ellipse_center": (float(cx), float(cy)),
-        "ellipse_axes": (float(a), float(b)),
-        "ellipse_angle": float(angle),
-    })
+    dbg.update(
+        {
+            "ellipse_found": True,
+            "ellipse_center": (float(cx), float(cy)),
+            "ellipse_axes": (float(a), float(b)),
+            "ellipse_angle": float(angle),
+        }
+    )
 
     rot = cv2.getRotationMatrix2D((cx, cy), -angle, 1.0)
-    rotated = cv2.warpAffine(bgr, rot, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    rotated = cv2.warpAffine(
+        bgr, rot, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
+    )
 
     scale = major / minor
-    S = np.array([[1.0, 0.0, 0.0],
-                  [0.0, scale, cy * (1.0 - scale)]], dtype=np.float32)
-    rect = cv2.warpAffine(rotated, S, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-
+    S = np.array(
+        [[1.0, 0.0, 0.0], [0.0, scale, cy * (1.0 - scale)]], dtype=np.float32
+    )
+    rect = cv2.warpAffine(
+        rotated, S, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
+    )
     dbg["affine_scale_y"] = float(scale)
     return rect, dbg
 
@@ -112,12 +120,13 @@ def _refine_circle(bgr: np.ndarray) -> Tuple[Tuple[float, float], float, Dict[st
     return (float(x), float(y)), float(r), dbg
 
 
-def _crop_square_around_circle(bgr: np.ndarray, center: Tuple[float, float], radius: float, out_size: int) -> Tuple[np.ndarray, Tuple[float, float], float]:
+def _crop_square_around_circle(
+    bgr: np.ndarray, center: Tuple[float, float], radius: float, out_size: int
+) -> Tuple[np.ndarray, Tuple[float, float], float]:
     h, w = bgr.shape[:2]
     cx, cy = center
     margin = int(radius * 0.10)
     half = int(radius + margin)
-
     x1 = max(0, int(cx) - half)
     y1 = max(0, int(cy) - half)
     x2 = min(w, int(cx) + half)
@@ -130,7 +139,6 @@ def _crop_square_around_circle(bgr: np.ndarray, center: Tuple[float, float], rad
 
     crop_h, crop_w = crop.shape[:2]
     resized = cv2.resize(crop, (out_size, out_size), interpolation=cv2.INTER_AREA)
-
     sx = out_size / crop_w
     sy = out_size / crop_h
     new_cx = (cx - x1) * sx
@@ -144,7 +152,9 @@ def _detect_arrow_present(bgr: np.ndarray) -> Tuple[bool, int]:
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 70, 160)
     lines = cv2.HoughLinesP(
-        edges, rho=1, theta=np.pi / 180,
+        edges,
+        rho=1,
+        theta=np.pi / 180,
         threshold=90,
         minLineLength=int(min(h, w) * 0.18),
         maxLineGap=12,
@@ -161,29 +171,31 @@ def _detect_arrow_present(bgr: np.ndarray) -> Tuple[bool, int]:
 
 
 # ----------------------------
-#  Pose refinement: midline + X
+# Pose refinement: midline + X
 # ----------------------------
-
 def _black_ink_mask(rect_bgr: np.ndarray) -> np.ndarray:
     lab = cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2Lab)
     L = lab[:, :, 0]
     thr = int(np.percentile(L, 15))
     mask = (L < thr).astype(np.uint8) * 255
     mask = cv2.medianBlur(mask, 5)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    )
     return mask
 
 
-def _detect_midline_from_right_digits(rect_bgr: np.ndarray) -> Tuple[Optional[float], Optional[float], Dict[str, object]]:
+def _detect_midline_from_right_digits(
+    rect_bgr: np.ndarray,
+) -> Tuple[Optional[float], Optional[float], Dict[str, object]]:
     h, w = rect_bgr.shape[:2]
     dbg: Dict[str, object] = {"midline_found": False}
-
     mask = _black_ink_mask(rect_bgr)
 
     x0 = int(w * 0.60)
     roi = mask[:, x0:w]
-    num_labels, labels, stats, cents = cv2.connectedComponentsWithStats(roi, connectivity=8)
 
+    num_labels, labels, stats, cents = cv2.connectedComponentsWithStats(roi, connectivity=8)
     pts = []
     for i in range(1, num_labels):
         area = stats[i, cv2.CC_STAT_AREA]
@@ -203,27 +215,34 @@ def _detect_midline_from_right_digits(rect_bgr: np.ndarray) -> Tuple[Optional[fl
     cov = (X.T @ X) / max(1, len(P) - 1)
     eigvals, eigvecs = np.linalg.eigh(cov)
     v = eigvecs[:, np.argmax(eigvals)]
+
     angle = float(np.degrees(np.arctan2(v[1], v[0])))
-
     mid_y = float(mean[1])
-
-    dbg.update({
-        "midline_found": True,
-        "midline_y": mid_y,
-        "midline_angle_deg": angle,
-        "midline_pts": len(pts),
-    })
+    dbg.update(
+        {
+            "midline_found": True,
+            "midline_y": mid_y,
+            "midline_angle_deg": angle,
+            "midline_pts": len(pts),
+        }
+    )
     return mid_y, angle, dbg
 
 
-def _rotate_about(rect_bgr: np.ndarray, center: Tuple[float, float], angle_deg: float) -> Tuple[np.ndarray, np.ndarray]:
+def _rotate_about(
+    rect_bgr: np.ndarray, center: Tuple[float, float], angle_deg: float
+) -> Tuple[np.ndarray, np.ndarray]:
     h, w = rect_bgr.shape[:2]
     M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
-    out = cv2.warpAffine(rect_bgr, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    out = cv2.warpAffine(
+        rect_bgr, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
+    )
     return out, M.astype(np.float32)
 
 
-def _detect_x_center(rect_bgr: np.ndarray, approx_center: Tuple[float, float], search_r: int = 120) -> Tuple[Optional[Tuple[float, float]], Dict[str, object]]:
+def _detect_x_center(
+    rect_bgr: np.ndarray, approx_center: Tuple[float, float], search_r: int = 120
+) -> Tuple[Optional[Tuple[float, float]], Dict[str, object]]:
     h, w = rect_bgr.shape[:2]
     cx, cy = approx_center
     dbg: Dict[str, object] = {"x_found": False}
@@ -239,7 +258,6 @@ def _detect_x_center(rect_bgr: np.ndarray, approx_center: Tuple[float, float], s
 
     mask = _black_ink_mask(roi)
     edges = cv2.Canny(mask, 60, 160)
-
     lines = cv2.HoughLinesP(
         edges,
         rho=1,
@@ -273,7 +291,6 @@ def _detect_x_center(rect_bgr: np.ndarray, approx_center: Tuple[float, float], s
 
     best = None
     best_score = 1e18
-
     for i in range(len(segs)):
         for j in range(i + 1, len(segs)):
             a1 = segs[i][4]
@@ -287,16 +304,17 @@ def _detect_x_center(rect_bgr: np.ndarray, approx_center: Tuple[float, float], s
             xA2, yA2, xB2, yB2 = segs[j][0], segs[j][1], segs[j][2], segs[j][3]
             A1, B1, C1 = _line_params(xA1, yA1, xB1, yB1)
             A2, B2, C2 = _line_params(xA2, yA2, xB2, yB2)
-
             det = A1 * B2 - A2 * B1
             if abs(det) < 1e-6:
                 continue
+
             ix = (B1 * C2 - B2 * C1) / det
             iy = (C1 * A2 - C2 * A1) / det
 
             roi_cx, roi_cy = (x2 - x1) / 2.0, (y2 - y1) / 2.0
             dist = (ix - roi_cx) ** 2 + (iy - roi_cy) ** 2
             score = dist + perp_err * 50.0
+
             if score < best_score:
                 best_score = score
                 best = (ix, iy, perp_err)
@@ -311,15 +329,15 @@ def _detect_x_center(rect_bgr: np.ndarray, approx_center: Tuple[float, float], s
     return (fx, fy), dbg
 
 
-def _build_similarity_M(src_center: Tuple[float, float], src_outer: float, angle_deg: float = 0.0) -> np.ndarray:
+def _build_similarity_M(
+    src_center: Tuple[float, float], src_outer: float, angle_deg: float = 0.0
+) -> np.ndarray:
     sx, sy = src_center
     s = 1.0 if src_outer <= 1e-6 else float(CANON_OUTER) / float(src_outer)
 
     theta = np.deg2rad(angle_deg)
     c, sn = float(np.cos(theta)), float(np.sin(theta))
-
-    A = np.array([[s * c, -s * sn],
-                  [s * sn,  s * c]], dtype=np.float32)
+    A = np.array([[s * c, -s * sn], [s * sn, s * c]], dtype=np.float32)
 
     dst = np.array([[CANON_CENTER[0]], [CANON_CENTER[1]]], dtype=np.float32)
     src = np.array([[sx], [sy]], dtype=np.float32)
@@ -329,12 +347,48 @@ def _build_similarity_M(src_center: Tuple[float, float], src_outer: float, angle
     return M
 
 
+def _quality_from_debug(debug: Dict[str, object]) -> Tuple[float, List[str]]:
+    """
+    Cheap, robust quality score based on which pose steps succeeded.
+    1.0 is best. Below ~0.55 => show safety mode.
+    """
+    score = 1.0
+    flags: List[str] = []
+
+    ellipse_found = bool(debug.get("ellipse_found", False))
+    if not ellipse_found:
+        score -= 0.25
+        flags.append("ellipse_not_found")
+
+    circle_found = bool(debug.get("circle_found", False))
+    if not circle_found:
+        score -= 0.30
+        flags.append("circle_not_found")
+
+    mid_dbg = debug.get("midline_debug", {}) or {}
+    if not bool(mid_dbg.get("midline_found", False)):
+        score -= 0.15
+        flags.append("midline_not_found")
+
+    x_dbg = debug.get("x_debug", {}) or {}
+    if not bool(x_dbg.get("x_found", False)):
+        score -= 0.10
+        flags.append("x_not_found")
+
+    # clamp
+    score = float(max(0.0, min(1.0, score)))
+    if score < 0.55 and "low_confidence" not in flags:
+        flags.append("low_confidence")
+    return score, flags
+
+
 def rectify_target(image_rgb: np.ndarray, out_size: int = CANON_SIZE) -> TargetRectifyResult:
     bgr = _rgb_to_bgr(image_rgb)
 
     rect1, dbg1 = _affine_rectify_by_ellipse(bgr)
     (cx, cy), r, dbg2 = _refine_circle(rect1)
-    rect2, (rcx, rcy), rr, = _crop_square_around_circle(rect1, (cx, cy), r, out_size)
+
+    rect2, (rcx, rcy), rr = _crop_square_around_circle(rect1, (cx, cy), r, out_size)
 
     arrow_present, line_count = _detect_arrow_present(rect2)
 
@@ -348,21 +402,22 @@ def rectify_target(image_rgb: np.ndarray, out_size: int = CANON_SIZE) -> TargetR
     debug["midline_debug"] = dbg_mid
 
     rect3 = rect2
-    M_mid = None
     if mid_angle is not None and abs(mid_angle) > 1.5:
-        rect3, M_mid = _rotate_about(rect2, (rcx, rcy), -mid_angle)
+        rect3, _ = _rotate_about(rect2, (rcx, rcy), -mid_angle)
         debug["midline_rotation_applied_deg"] = float(-mid_angle)
     else:
         debug["midline_rotation_applied_deg"] = 0.0
 
-    # after rotation, RE-REFINE circle (key improvement)
+    # after rotation, re-refine circle
     (ccx2, ccy2), rr2, dbg_circle2 = _refine_circle(rect3)
     debug["circle_refine_after_midline"] = dbg_circle2
+    # also expose second refine result as the "circle_found" for quality gate (more relevant)
+    debug["circle_found"] = bool(dbg_circle2.get("circle_found", debug.get("circle_found", False)))
 
     circle_center = (ccx2, ccy2)
     outer_radius = rr2
 
-    # midline y after rotation (for debug)
+    # midline y after rotation (debug)
     mid_y2, _, dbg_mid2 = _detect_midline_from_right_digits(rect3)
     debug["midline_debug_after"] = dbg_mid2
     midline_y_final = mid_y2
@@ -377,6 +432,11 @@ def rectify_target(image_rgb: np.ndarray, out_size: int = CANON_SIZE) -> TargetR
     M_rect_to_canon = _build_similarity_M(center_final, outer_radius, angle_deg=0.0)
     debug["M_rect_to_canon"] = M_rect_to_canon.tolist()
 
+    # NEW: quality
+    quality_score, quality_flags = _quality_from_debug(debug)
+    debug["quality_score"] = quality_score
+    debug["quality_flags"] = quality_flags
+
     return TargetRectifyResult(
         rect_bgr=rect3,
         circle_center=circle_center,
@@ -387,6 +447,8 @@ def rectify_target(image_rgb: np.ndarray, out_size: int = CANON_SIZE) -> TargetR
         M_rect_to_canon=M_rect_to_canon,
         arrow_present=arrow_present,
         debug=debug,
+        quality_score=quality_score,
+        quality_flags=quality_flags,
     )
 
 
@@ -407,70 +469,67 @@ def propose_hit_points(
     """
     Better candidate generation:
     - if arrow_present: detect all long line segments globally; use endpoint closer to center as 'tip-side' seed.
-    - else: fallback to blob-ish dark marks (simple LoG-ish).
+    - else: blob candidates from Laplacian/OTSU.
     """
     h, w = rect_bgr.shape[:2]
     cx, cy = center_final
 
+    gray = cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2GRAY)
+
+    pts: List[Tuple[float, float]] = []
+
     if arrow_present:
-        gray = cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(gray, 60, 150)
+        edges = cv2.Canny(gray, 70, 160)
         lines = cv2.HoughLinesP(
             edges,
             rho=1,
             theta=np.pi / 180,
-            threshold=80,
-            minLineLength=int(min(h, w) * 0.25),
-            maxLineGap=14,
+            threshold=90,
+            minLineLength=int(min(h, w) * 0.18),
+            maxLineGap=12,
         )
-        if lines is None:
-            return []
+        if lines is not None:
+            for (x1, y1, x2, y2) in lines[:, 0, :]:
+                d1 = (x1 - cx) ** 2 + (y1 - cy) ** 2
+                d2 = (x2 - cx) ** 2 + (y2 - cy) ** 2
+                if d1 <= d2:
+                    pts.append((float(x1), float(y1)))
+                else:
+                    pts.append((float(x2), float(y2)))
 
-        tips: List[Tuple[float, float]] = []
-        for (x1, y1, x2, y2) in lines[:, 0, :]:
-            L = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
-            if L < min(h, w) * 0.22:
+        # sort by radial distance to center (nearer first)
+        pts = sorted(pts, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
+
+    if (not pts) or (not arrow_present):
+        g = cv2.GaussianBlur(gray, (0, 0), 1.2)
+        lap = cv2.Laplacian(g, cv2.CV_32F, ksize=3)
+        lap = np.abs(lap)
+        lap_u8 = cv2.normalize(lap, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        _, th = cv2.threshold(lap_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        th = cv2.medianBlur(th, 5)
+
+        num_labels, labels, stats, cents = cv2.connectedComponentsWithStats(th, connectivity=8)
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area < 40 or area > 5000:
                 continue
-            d1 = (x1 - cx) ** 2 + (y1 - cy) ** 2
-            d2 = (x2 - cx) ** 2 + (y2 - cy) ** 2
-            if d1 <= d2:
-                tips.append((float(x1), float(y1)))
-            else:
-                tips.append((float(x2), float(y2)))
+            bx, by = cents[i]
+            pts.append((float(bx), float(by)))
 
-        # de-dup tips
-        dedup: List[Tuple[float, float]] = []
-        min_d2 = 22.0 ** 2
-        for p in tips:
-            ok = True
-            for q in dedup:
-                if (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 < min_d2:
-                    ok = False
-                    break
-            if ok:
-                dedup.append(p)
+        pts = sorted(pts, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
 
-        # sort by radius (closer to center first tends to be more stable)
-        dedup.sort(key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
-        return dedup[:max_points]
+    # de-dup quickly
+    dedup: List[Tuple[float, float]] = []
+    min_d2 = 28.0 ** 2
+    for p in pts:
+        ok = True
+        for q in dedup:
+            if (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 < min_d2:
+                ok = False
+                break
+        if ok:
+            dedup.append(p)
+        if len(dedup) >= max_points:
+            break
 
-    # no arrow: blob-like candidates
-    gray = cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2GRAY)
-    g = cv2.GaussianBlur(gray, (0, 0), 1.2)
-    lap = cv2.Laplacian(g, cv2.CV_32F, ksize=3)
-    lap = np.abs(lap)
-    lap_u8 = cv2.normalize(lap, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    _, th = cv2.threshold(lap_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    th = cv2.medianBlur(th, 5)
-
-    num_labels, labels, stats, cents = cv2.connectedComponentsWithStats(th, connectivity=8)
-    pts: List[Tuple[float, float]] = []
-    for i in range(1, num_labels):
-        area = stats[i, cv2.CC_STAT_AREA]
-        if area < 30 or area > 2000:
-            continue
-        x, y = cents[i]
-        pts.append((float(x), float(y)))
-
-    pts.sort(key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
-    return pts[:max_points]
+    return dedup
