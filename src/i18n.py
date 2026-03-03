@@ -21,8 +21,8 @@ TEXT = {
     "upload": {"ja": "的の写真をアップロード", "en": "Upload target photo", "zh": "上传靶面照片"},
     "tap_points": {
         "ja": "矢の位置をクリック（点で指定）",
-        "en": "Click arrow holes (mark points)",
-        "zh": "点击标出箭孔位置（点）",
+        "en": "Confirm hits (edit points)",
+        "zh": "确认命中点（编辑点位）",
     },
     "analyze": {"ja": "分析する", "en": "Analyze", "zh": "分析"},
     "clear": {"ja": "点をクリア", "en": "Clear points", "zh": "清空点位"},
@@ -33,7 +33,11 @@ TEXT = {
         "ja": "先に矢の点を必要数だけ指定してください。",
         "en": "Please mark the required number of points first.",
         "zh": "请先标出足够数量的点。",
-    }
+    },
+
+    "target_face": {"ja": "的（ターゲットフェイス）", "en": "Target face", "zh": "靶面类型"},
+    "target_80": {"ja": "80cm（屋外 / 10リング）", "en": "80cm (outdoor / 10-ring)", "zh": "80cm（户外 / 10环）"},
+    "target_40": {"ja": "40cm（室内 / 10リング）", "en": "40cm (indoor / 10-ring)", "zh": "40cm（室内 / 10环）"},
 }
 
 def t(key: str, lang: str) -> str:
