@@ -9,13 +9,18 @@ import cv2
 
 @dataclass
 class TargetRectifyResult:
-    rect_bgr: np.ndarray
-    circle_center: Tuple[float, float]
-    outer_radius: float
-    midline_y: Optional[float]
-    x_center: Optional[Tuple[float, float]]
-    center_final: Tuple[float, float]
-    M_rect_to_canon: np.ndarray
+    rect_bgr: np.ndarray                 # rectified photo (square)
+    circle_center: Tuple[float, float]   # center from circle (rect coords)
+    outer_radius: float                  # outer radius (rect coords)
+
+    # refined pose
+    midline_y: Optional[float]           # detected horizontal midline y in rect coords (after midline rotation)
+    x_center: Optional[Tuple[float, float]]  # detected X center if found
+    center_final: Tuple[float, float]    # final center (X if found else circle center)
+
+    # mapping from rect coords -> canonical coords (900x900)
+    M_rect_to_canon: np.ndarray          # 2x3 float32 similarity transform
+
     arrow_present: bool
     debug: Dict[str, object]
 
@@ -37,6 +42,9 @@ def _largest_contour(edge: np.ndarray) -> Optional[np.ndarray]:
 
 
 def _affine_rectify_by_ellipse(bgr: np.ndarray) -> Tuple[np.ndarray, Dict[str, object]]:
+    """
+    Coarse rectify: fit outer ellipse boundary then affine-correct.
+    """
     h, w = bgr.shape[:2]
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (7, 7), 1.5)
@@ -45,8 +53,11 @@ def _affine_rectify_by_ellipse(bgr: np.ndarray) -> Tuple[np.ndarray, Dict[str, o
     cnt = _largest_contour(edges)
     dbg: Dict[str, object] = {"ellipse_found": False}
 
-    if cnt is None or len(cnt) < 50 or len(cnt) < 5:
-        return bgr.copy(), {"ellipse_found": False, "fallback": "no_contour_or_small"}
+    if cnt is None or len(cnt) < 50:
+        return bgr.copy(), {"ellipse_found": False, "fallback": "no_contour"}
+
+    if len(cnt) < 5:
+        return bgr.copy(), {"ellipse_found": False, "fallback": "contour_too_small"}
 
     ellipse = cv2.fitEllipse(cnt)
     (cx, cy), (a, b), angle = ellipse
@@ -149,6 +160,10 @@ def _detect_arrow_present(bgr: np.ndarray) -> Tuple[bool, int]:
     return cnt >= 2, cnt
 
 
+# ----------------------------
+#  Pose refinement: midline + X
+# ----------------------------
+
 def _black_ink_mask(rect_bgr: np.ndarray) -> np.ndarray:
     lab = cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2Lab)
     L = lab[:, :, 0]
@@ -191,7 +206,13 @@ def _detect_midline_from_right_digits(rect_bgr: np.ndarray) -> Tuple[Optional[fl
     angle = float(np.degrees(np.arctan2(v[1], v[0])))
 
     mid_y = float(mean[1])
-    dbg.update({"midline_found": True, "midline_y": mid_y, "midline_angle_deg": angle, "midline_pts": len(pts)})
+
+    dbg.update({
+        "midline_found": True,
+        "midline_y": mid_y,
+        "midline_angle_deg": angle,
+        "midline_pts": len(pts),
+    })
     return mid_y, angle, dbg
 
 
@@ -219,9 +240,14 @@ def _detect_x_center(rect_bgr: np.ndarray, approx_center: Tuple[float, float], s
     mask = _black_ink_mask(roi)
     edges = cv2.Canny(mask, 60, 160)
 
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=35,
-                            minLineLength=max(12, int(min(roi.shape[:2]) * 0.15)),
-                            maxLineGap=6)
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=35,
+        minLineLength=max(12, int(min(roi.shape[:2]) * 0.15)),
+        maxLineGap=6,
+    )
     if lines is None or len(lines) < 2:
         dbg["fallback"] = "no_lines"
         return None, dbg
@@ -247,6 +273,7 @@ def _detect_x_center(rect_bgr: np.ndarray, approx_center: Tuple[float, float], s
 
     best = None
     best_score = 1e18
+
     for i in range(len(segs)):
         for j in range(i + 1, len(segs)):
             a1 = segs[i][4]
@@ -267,7 +294,7 @@ def _detect_x_center(rect_bgr: np.ndarray, approx_center: Tuple[float, float], s
             ix = (B1 * C2 - B2 * C1) / det
             iy = (C1 * A2 - C2 * A1) / det
 
-            roi_cx, roi_cy = roi.shape[1] / 2.0, roi.shape[0] / 2.0
+            roi_cx, roi_cy = (x2 - x1) / 2.0, (y2 - y1) / 2.0
             dist = (ix - roi_cx) ** 2 + (iy - roi_cy) ** 2
             score = dist + perp_err * 50.0
             if score < best_score:
@@ -284,15 +311,20 @@ def _detect_x_center(rect_bgr: np.ndarray, approx_center: Tuple[float, float], s
     return (fx, fy), dbg
 
 
-def _build_similarity_M(src_center: Tuple[float, float], src_outer: float) -> np.ndarray:
+def _build_similarity_M(src_center: Tuple[float, float], src_outer: float, angle_deg: float = 0.0) -> np.ndarray:
     sx, sy = src_center
     s = 1.0 if src_outer <= 1e-6 else float(CANON_OUTER) / float(src_outer)
 
-    A = np.array([[s, 0.0],
-                  [0.0, s]], dtype=np.float32)
+    theta = np.deg2rad(angle_deg)
+    c, sn = float(np.cos(theta)), float(np.sin(theta))
+
+    A = np.array([[s * c, -s * sn],
+                  [s * sn,  s * c]], dtype=np.float32)
+
     dst = np.array([[CANON_CENTER[0]], [CANON_CENTER[1]]], dtype=np.float32)
     src = np.array([[sx], [sy]], dtype=np.float32)
     t = dst - A @ src
+
     M = np.hstack([A, t]).astype(np.float32)
     return M
 
@@ -302,7 +334,7 @@ def rectify_target(image_rgb: np.ndarray, out_size: int = CANON_SIZE) -> TargetR
 
     rect1, dbg1 = _affine_rectify_by_ellipse(bgr)
     (cx, cy), r, dbg2 = _refine_circle(rect1)
-    rect2, (rcx, rcy), rr = _crop_square_around_circle(rect1, (cx, cy), r, out_size)
+    rect2, (rcx, rcy), rr, = _crop_square_around_circle(rect1, (cx, cy), r, out_size)
 
     arrow_present, line_count = _detect_arrow_present(rect2)
 
@@ -311,39 +343,45 @@ def rectify_target(image_rgb: np.ndarray, out_size: int = CANON_SIZE) -> TargetR
     debug.update(dbg2)
     debug.update({"arrow_present": arrow_present, "line_count": int(line_count)})
 
+    # midline (digits) -> rotate to make it horizontal
     mid_y, mid_angle, dbg_mid = _detect_midline_from_right_digits(rect2)
     debug["midline_debug"] = dbg_mid
 
     rect3 = rect2
+    M_mid = None
     if mid_angle is not None and abs(mid_angle) > 1.5:
-        rect3, _ = _rotate_about(rect2, (rcx, rcy), -mid_angle)
+        rect3, M_mid = _rotate_about(rect2, (rcx, rcy), -mid_angle)
         debug["midline_rotation_applied_deg"] = float(-mid_angle)
     else:
         debug["midline_rotation_applied_deg"] = 0.0
 
-    # refine circle again after rotation
+    # after rotation, RE-REFINE circle (key improvement)
     (ccx2, ccy2), rr2, dbg_circle2 = _refine_circle(rect3)
     debug["circle_refine_after_midline"] = dbg_circle2
 
     circle_center = (ccx2, ccy2)
     outer_radius = rr2
 
+    # midline y after rotation (for debug)
     mid_y2, _, dbg_mid2 = _detect_midline_from_right_digits(rect3)
     debug["midline_debug_after"] = dbg_mid2
+    midline_y_final = mid_y2
 
+    # detect X near refined circle center
     x_center, dbg_x = _detect_x_center(rect3, circle_center, search_r=140)
     debug["x_debug"] = dbg_x
 
     center_final = x_center if x_center is not None else circle_center
     debug["center_final_source"] = "x" if x_center is not None else "circle"
 
-    M_rect_to_canon = _build_similarity_M(center_final, outer_radius)
+    M_rect_to_canon = _build_similarity_M(center_final, outer_radius, angle_deg=0.0)
+    debug["M_rect_to_canon"] = M_rect_to_canon.tolist()
 
     return TargetRectifyResult(
         rect_bgr=rect3,
         circle_center=circle_center,
         outer_radius=outer_radius,
-        midline_y=mid_y2,
+        midline_y=midline_y_final,
         x_center=x_center,
         center_final=center_final,
         M_rect_to_canon=M_rect_to_canon,
@@ -366,16 +404,25 @@ def propose_hit_points(
     arrow_present: bool,
     max_points: int = 12,
 ) -> List[Tuple[float, float]]:
+    """
+    Better candidate generation:
+    - if arrow_present: detect all long line segments globally; use endpoint closer to center as 'tip-side' seed.
+    - else: fallback to blob-ish dark marks (simple LoG-ish).
+    """
     h, w = rect_bgr.shape[:2]
     cx, cy = center_final
 
     if arrow_present:
         gray = cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2GRAY)
         edges = cv2.Canny(gray, 60, 150)
-        lines = cv2.HoughLinesP(edges, 1, np.pi / 180,
-                                threshold=80,
-                                minLineLength=int(min(h, w) * 0.25),
-                                maxLineGap=14)
+        lines = cv2.HoughLinesP(
+            edges,
+            rho=1,
+            theta=np.pi / 180,
+            threshold=80,
+            minLineLength=int(min(h, w) * 0.25),
+            maxLineGap=14,
+        )
         if lines is None:
             return []
 
@@ -386,18 +433,28 @@ def propose_hit_points(
                 continue
             d1 = (x1 - cx) ** 2 + (y1 - cy) ** 2
             d2 = (x2 - cx) ** 2 + (y2 - cy) ** 2
-            tips.append((float(x1), float(y1))) if d1 <= d2 else tips.append((float(x2), float(y2)))
+            if d1 <= d2:
+                tips.append((float(x1), float(y1)))
+            else:
+                tips.append((float(x2), float(y2)))
 
+        # de-dup tips
         dedup: List[Tuple[float, float]] = []
         min_d2 = 22.0 ** 2
         for p in tips:
-            if all((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 >= min_d2 for q in dedup):
+            ok = True
+            for q in dedup:
+                if (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 < min_d2:
+                    ok = False
+                    break
+            if ok:
                 dedup.append(p)
 
+        # sort by radius (closer to center first tends to be more stable)
         dedup.sort(key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
         return dedup[:max_points]
 
-    # no arrow: blob-ish candidates
+    # no arrow: blob-like candidates
     gray = cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2GRAY)
     g = cv2.GaussianBlur(gray, (0, 0), 1.2)
     lap = cv2.Laplacian(g, cv2.CV_32F, ksize=3)
@@ -406,7 +463,7 @@ def propose_hit_points(
     _, th = cv2.threshold(lap_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     th = cv2.medianBlur(th, 5)
 
-    num_labels, _, stats, cents = cv2.connectedComponentsWithStats(th, connectivity=8)
+    num_labels, labels, stats, cents = cv2.connectedComponentsWithStats(th, connectivity=8)
     pts: List[Tuple[float, float]] = []
     for i in range(1, num_labels):
         area = stats[i, cv2.CC_STAT_AREA]
