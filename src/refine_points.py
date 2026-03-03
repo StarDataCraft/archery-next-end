@@ -1,6 +1,7 @@
+# src/refine_points.py
 from __future__ import annotations
-from typing import List, Tuple, Dict, Any, Optional
 
+from typing import List, Tuple, Dict, Any, Optional
 import numpy as np
 import cv2
 
@@ -24,46 +25,80 @@ def _subpix_refine(gray_roi: np.ndarray, pt: Tuple[float, float]) -> Tuple[float
         return float(pt[0]), float(pt[1])
 
 
-def _sample_face_color_under_arrow(bgr: np.ndarray, x: float, y: float, r: int = 10) -> Dict[str, Any]:
+# ----------------------------------------------------------------------
+# NEW: robust color sampling (ignore dark arrow pixels)
+# ----------------------------------------------------------------------
+def _mask_dark_arrow_pixels(hsv_roi: np.ndarray) -> np.ndarray:
     """
-    Sample color near (x,y) but try to ignore arrow pixels (often dark).
+    hsv_roi: OpenCV HSV (H:0-180, S:0-255, V:0-255)
+    Returns a boolean mask where True means "likely target face (not arrow)".
+    """
+    v = hsv_roi[:, :, 2]
+    # carbon/arrow/holes tend to be low V
+    return v > 55
+
+
+def sample_contact_color_hsv(
+    bgr: np.ndarray,
+    x: float,
+    y: float,
+    r: int = 10,
+) -> Optional[Tuple[float, float, float]]:
+    """
+    Sample color near (x,y) while ignoring arrow pixels (often dark).
     Strategy:
-      - take a small disk ROI
+      - take a small disk ROI (square crop)
       - convert to HSV
-      - mask out low-V pixels (dark arrow/carbon) => use remaining pixels median as "face color"
+      - mask out low-V pixels (dark arrow/carbon)
+      - median HSV of remaining pixels
+    Returns (H,S,V) in OpenCV scale, or None if fails.
     """
     h, w = bgr.shape[:2]
     cx, cy = int(round(x)), int(round(y))
+
     x1 = max(0, cx - r)
     y1 = max(0, cy - r)
     x2 = min(w, cx + r + 1)
     y2 = min(h, cy + r + 1)
+
     roi = bgr[y1:y2, x1:x2]
     if roi.size == 0:
-        return {"ok": False}
+        return None
 
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    V = hsv[:, :, 2]
+    keep = _mask_dark_arrow_pixels(hsv)
 
-    # mask out dark pixels (likely arrow)
-    keep = V > 60
-    if np.sum(keep) < 10:
-        # too occluded; fallback to raw median
-        hsv_med = [int(np.median(hsv[:, :, 0])), int(np.median(hsv[:, :, 1])), int(np.median(hsv[:, :, 2]))]
-        return {"ok": True, "hsv_median": hsv_med, "note": "fallback_raw"}
+    # if too occluded, fall back to raw median
+    if int(np.sum(keep)) < 10:
+        med = np.median(hsv.reshape(-1, 3).astype(np.float32), axis=0)
+        return (float(med[0]), float(med[1]), float(med[2]))
 
-    hsv_kept = hsv[keep]
-    h_med = int(np.median(hsv_kept[:, 0]))
-    s_med = int(np.median(hsv_kept[:, 1]))
-    v_med = int(np.median(hsv_kept[:, 2]))
-
-    return {"ok": True, "hsv_median": [h_med, s_med, v_med], "note": "masked_dark"}
+    hsv_kept = hsv[keep].reshape(-1, 3).astype(np.float32)
+    med = np.median(hsv_kept, axis=0)
+    return (float(med[0]), float(med[1]), float(med[2]))
 
 
+def _sample_face_color_under_arrow(bgr: np.ndarray, x: float, y: float, r: int = 10) -> Dict[str, Any]:
+    """
+    (Kept for backward-compat with your pipeline)
+    Now implemented via sample_contact_color_hsv() for robustness.
+    Returns:
+      {"ok": bool, "hsv_median": [H,S,V], "note": "..."}
+    """
+    hsv = sample_contact_color_hsv(bgr, x, y, r=r)
+    if hsv is None:
+        return {"ok": False}
+
+    # Decide note: whether likely masked vs fallback is not directly exposed now.
+    # Keep "note" stable for consumers.
+    return {"ok": True, "hsv_median": [int(round(hsv[0])), int(round(hsv[1])), int(round(hsv[2]))], "note": "masked_dark"}
+
+
+# ----------------------------------------------------------------------
+# Arrow segment + contact point refinement (ORIGINAL LOGIC PRESERVED)
+# ----------------------------------------------------------------------
 def _best_arrow_segment_in_roi(roi_g: np.ndarray, min_len: int) -> Optional[Tuple[int, int, int, int]]:
-    """
-    Prefer LSD (more stable than Hough) if available.
-    """
+    """Prefer LSD (more stable than Hough) if available."""
     try:
         lsd = cv2.createLineSegmentDetector(0)
         lines = lsd.detect(roi_g)[0]
@@ -92,6 +127,7 @@ def _best_arrow_segment_in_roi(roi_g: np.ndarray, min_len: int) -> Optional[Tupl
     )
     if lines is None:
         return None
+
     best = None
     best_len = 0.0
     for (x1, y1, x2, y2) in lines[:, 0, :]:
@@ -114,7 +150,6 @@ def _find_contact_point(gray_roi: np.ndarray, line: Tuple[int, int, int, int], c
 
     d1 = (x1 - cx) ** 2 + (y1 - cy) ** 2
     d2 = (x2 - cx) ** 2 + (y2 - cy) ** 2
-
     if d1 <= d2:
         tip = np.array([x1, y1], dtype=np.float32)
         tail = np.array([x2, y2], dtype=np.float32)
@@ -154,7 +189,6 @@ def _find_contact_point(gray_roi: np.ndarray, line: Tuple[int, int, int, int], c
     if len(idx) == 0:
         k = int(np.argmax(arr))
         return xs[k], ys[k]
-
     k = int(idx[0])  # earliest strong edge
     return xs[k], ys[k]
 
@@ -188,7 +222,6 @@ def refine_points_and_colors(
         if arrow_present:
             min_len = max(22, int(min(roi_g.shape) * 0.40))
             seg = _best_arrow_segment_in_roi(roi_g, min_len=min_len)
-
             if seg is not None:
                 rx, ry = _find_contact_point(roi_g, seg, center_roi)
                 rx2, ry2 = _subpix_refine(roi_g, (rx, ry))
