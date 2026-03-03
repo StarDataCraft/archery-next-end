@@ -34,7 +34,7 @@ except Exception:
 
 @dataclass
 class CoachConfig:
-    pdf_path: str = "docs/Archery_The_Art_of_Repetition.pdf"
+    pdf_path: str = "docs/Archery The Art of Repetition (Simon Needham ).pdf"
     cache_dir: str = ".cache/coach"
     embed_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     chunk_chars: int = 900
