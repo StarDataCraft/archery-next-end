@@ -14,17 +14,17 @@ class TargetRectifyResult:
     outer_radius: float  # outer radius (rect coords)
 
     # refined pose
-    midline_y: Optional[float]  # detected horizontal midline y in rect coords (after midline rotation)
-    x_center: Optional[Tuple[float, float]]  # detected X center if found
-    center_final: Tuple[float, float]  # final center (X if found else circle center)
+    midline_y: Optional[float]
+    x_center: Optional[Tuple[float, float]]
+    center_final: Tuple[float, float]
 
     # mapping from rect coords -> canonical coords (900x900)
-    M_rect_to_canon: np.ndarray  # 2x3 float32 similarity transform
+    M_rect_to_canon: np.ndarray
 
     arrow_present: bool
     debug: Dict[str, object]
 
-    # NEW: quality summary
+    # quality summary
     quality_score: float
     quality_flags: List[str]
 
@@ -170,9 +170,6 @@ def _detect_arrow_present(bgr: np.ndarray) -> Tuple[bool, int]:
     return cnt >= 2, cnt
 
 
-# ----------------------------
-# Pose refinement: midline + X
-# ----------------------------
 def _black_ink_mask(rect_bgr: np.ndarray) -> np.ndarray:
     lab = cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2Lab)
     L = lab[:, :, 0]
@@ -329,6 +326,88 @@ def _detect_x_center(
     return (fx, fy), dbg
 
 
+# -----------------------------
+# NEW: outer radius by WHITE ring color
+# -----------------------------
+def _refine_outer_radius_by_white(
+    rect_bgr: np.ndarray,
+    center: Tuple[float, float],
+) -> Tuple[Optional[float], Dict[str, object]]:
+    """
+    Use HSV threshold to find the white outer ring/paper region and fit a circle.
+    This is very effective for correcting 'outer_radius too small' problems.
+    """
+    h, w = rect_bgr.shape[:2]
+    cx, cy = float(center[0]), float(center[1])
+
+    hsv = cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2HSV)
+
+    # "white": low saturation + high value
+    # (tolerant thresholds to handle lighting)
+    lower = np.array([0, 0, 170], dtype=np.uint8)
+    upper = np.array([180, 70, 255], dtype=np.uint8)
+    mask = cv2.inRange(hsv, lower, upper)
+
+    # remove small holes / noise
+    mask = cv2.medianBlur(mask, 7)
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    )
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    )
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    dbg: Dict[str, object] = {"white_outer_found": False}
+
+    if not contours:
+        dbg["fallback"] = "no_white_contours"
+        return None, dbg
+
+    # Prefer contour that contains the center (or the largest one)
+    chosen = None
+    chosen_area = -1.0
+    for cnt in contours:
+        area = float(cv2.contourArea(cnt))
+        if area < (h * w * 0.01):
+            continue
+        # test if center point is inside contour
+        inside = cv2.pointPolygonTest(cnt, (cx, cy), False) >= 0
+        # score: containing center preferred; otherwise use area
+        score = area + (1e9 if inside else 0.0)
+        if score > chosen_area:
+            chosen_area = score
+            chosen = cnt
+
+    if chosen is None:
+        dbg["fallback"] = "no_large_white_contour"
+        return None, dbg
+
+    (x, y), r = cv2.minEnclosingCircle(chosen)
+    r = float(r)
+
+    # sanity: radius should be plausible
+    # since rect_bgr is a crop around the target, outer radius should be sizeable
+    if r < 0.20 * min(h, w) or r > 0.55 * min(h, w):
+        dbg.update(
+            {
+                "white_outer_found": False,
+                "fallback": "radius_out_of_range",
+                "r": r,
+            }
+        )
+        return None, dbg
+
+    dbg.update(
+        {
+            "white_outer_found": True,
+            "white_circle_xy_r": (float(x), float(y), float(r)),
+            "white_mask_ratio": float(mask.mean() / 255.0),
+        }
+    )
+    return r, dbg
+
+
 def _build_similarity_M(
     src_center: Tuple[float, float], src_outer: float, angle_deg: float = 0.0
 ) -> np.ndarray:
@@ -350,24 +429,24 @@ def _build_similarity_M(
 def _quality_from_debug(debug: Dict[str, object]) -> Tuple[float, List[str]]:
     """
     Cheap, robust quality score based on which pose steps succeeded.
-    1.0 is best. Below ~0.55 => show safety mode.
     """
     score = 1.0
     flags: List[str] = []
 
-    ellipse_found = bool(debug.get("ellipse_found", False))
-    if not ellipse_found:
-        score -= 0.25
+    if not bool(debug.get("ellipse_found", False)):
+        score -= 0.20
         flags.append("ellipse_not_found")
 
-    circle_found = bool(debug.get("circle_found", False))
-    if not circle_found:
-        score -= 0.30
+    # use 'circle_refine_after_midline' if present
+    circle2 = debug.get("circle_refine_after_midline", {}) or {}
+    circle_ok = bool(circle2.get("circle_found", debug.get("circle_found", False)))
+    if not circle_ok:
+        score -= 0.25
         flags.append("circle_not_found")
 
     mid_dbg = debug.get("midline_debug", {}) or {}
     if not bool(mid_dbg.get("midline_found", False)):
-        score -= 0.15
+        score -= 0.10
         flags.append("midline_not_found")
 
     x_dbg = debug.get("x_debug", {}) or {}
@@ -375,9 +454,14 @@ def _quality_from_debug(debug: Dict[str, object]) -> Tuple[float, List[str]]:
         score -= 0.10
         flags.append("x_not_found")
 
-    # clamp
+    # NEW: outer radius calibration
+    white_dbg = debug.get("white_outer_debug", {}) or {}
+    if not bool(white_dbg.get("white_outer_found", False)):
+        score -= 0.10
+        flags.append("white_outer_not_found")
+
     score = float(max(0.0, min(1.0, score)))
-    if score < 0.55 and "low_confidence" not in flags:
+    if score < 0.55:
         flags.append("low_confidence")
     return score, flags
 
@@ -397,7 +481,7 @@ def rectify_target(image_rgb: np.ndarray, out_size: int = CANON_SIZE) -> TargetR
     debug.update(dbg2)
     debug.update({"arrow_present": arrow_present, "line_count": int(line_count)})
 
-    # midline (digits) -> rotate to make it horizontal
+    # midline -> rotate
     mid_y, mid_angle, dbg_mid = _detect_midline_from_right_digits(rect2)
     debug["midline_debug"] = dbg_mid
 
@@ -411,28 +495,50 @@ def rectify_target(image_rgb: np.ndarray, out_size: int = CANON_SIZE) -> TargetR
     # after rotation, re-refine circle
     (ccx2, ccy2), rr2, dbg_circle2 = _refine_circle(rect3)
     debug["circle_refine_after_midline"] = dbg_circle2
-    # also expose second refine result as the "circle_found" for quality gate (more relevant)
-    debug["circle_found"] = bool(dbg_circle2.get("circle_found", debug.get("circle_found", False)))
 
     circle_center = (ccx2, ccy2)
     outer_radius = rr2
 
-    # midline y after rotation (debug)
+    # midline y after rotation (debug only)
     mid_y2, _, dbg_mid2 = _detect_midline_from_right_digits(rect3)
     debug["midline_debug_after"] = dbg_mid2
     midline_y_final = mid_y2
 
-    # detect X near refined circle center
+    # detect X near circle center
     x_center, dbg_x = _detect_x_center(rect3, circle_center, search_r=140)
     debug["x_debug"] = dbg_x
 
     center_final = x_center if x_center is not None else circle_center
     debug["center_final_source"] = "x" if x_center is not None else "circle"
 
+    # -----------------------------
+    # NEW: outer radius calibration using WHITE ring color
+    # -----------------------------
+    white_r, dbg_white = _refine_outer_radius_by_white(rect3, center_final)
+    debug["white_outer_debug"] = dbg_white
+
+    if white_r is not None:
+        # If hough circle radius is too small (common), prefer white-based radius.
+        # Also avoid crazy jump: only accept if within +/- 25% of current radius.
+        ratio = float(white_r / max(1e-6, outer_radius))
+        debug["white_vs_hough_radius_ratio"] = ratio
+
+        if 0.75 <= ratio <= 1.35:
+            outer_radius = float(white_r)
+            debug["outer_radius_source"] = "white_outer"
+        else:
+            # still keep ratio in debug; don't apply if too inconsistent
+            debug["outer_radius_source"] = "hough_circle"
+    else:
+        debug["outer_radius_source"] = "hough_circle"
+
+    debug["outer_radius_final"] = float(outer_radius)
+
+    # build mapping
     M_rect_to_canon = _build_similarity_M(center_final, outer_radius, angle_deg=0.0)
     debug["M_rect_to_canon"] = M_rect_to_canon.tolist()
 
-    # NEW: quality
+    # quality
     quality_score, quality_flags = _quality_from_debug(debug)
     debug["quality_score"] = quality_score
     debug["quality_flags"] = quality_flags
@@ -440,7 +546,7 @@ def rectify_target(image_rgb: np.ndarray, out_size: int = CANON_SIZE) -> TargetR
     return TargetRectifyResult(
         rect_bgr=rect3,
         circle_center=circle_center,
-        outer_radius=outer_radius,
+        outer_radius=float(outer_radius),
         midline_y=midline_y_final,
         x_center=x_center,
         center_final=center_final,
@@ -467,8 +573,8 @@ def propose_hit_points(
     max_points: int = 12,
 ) -> List[Tuple[float, float]]:
     """
-    Better candidate generation:
-    - if arrow_present: detect all long line segments globally; use endpoint closer to center as 'tip-side' seed.
+    Candidate generation:
+    - if arrow_present: detect long line segments; use endpoint closer to center as 'tip-side' seed.
     - else: blob candidates from Laplacian/OTSU.
     """
     h, w = rect_bgr.shape[:2]
@@ -497,7 +603,6 @@ def propose_hit_points(
                 else:
                     pts.append((float(x2), float(y2)))
 
-        # sort by radial distance to center (nearer first)
         pts = sorted(pts, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
 
     if (not pts) or (not arrow_present):
