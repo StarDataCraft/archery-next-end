@@ -10,8 +10,8 @@ from .state import goto_step, reset_shot, reset_cv_cache
 from .metrics import compute_metrics, classify_shape
 from .rules import next_end_advice
 from .storage import make_log_entry, export_log_json
-from .cv_target import rectify_target, propose_hit_points, draw_overlay
-from .scoring import ring_radii_px, score_hits
+from .cv_target import rectify_target, propose_hit_points, draw_overlay, detect_ring_radii
+from .scoring import score_hits
 
 
 def _bgr_to_rgb_uint8(bgr: np.ndarray) -> np.ndarray:
@@ -64,7 +64,6 @@ def render_analyze_step():
             value=int(st.session_state.arrows_per_end), step=1
         )
     with top3:
-        # target face select
         face = st.selectbox(
             t("target_face", lang),
             options=["80cm_10ring", "40cm_10ring"],
@@ -74,8 +73,7 @@ def render_analyze_step():
         if face != st.session_state.target_face:
             st.session_state.target_face = face
             st.session_state.last_result = None
-            # scoring overlay depends on rings, so clear cached overlay
-            st.session_state.overlay_image_rgb = None
+            st.session_state.overlay_image_rgb = None  # ring overlay depends on detection
 
     colA, colB = st.columns([1, 1])
     with colA:
@@ -93,7 +91,7 @@ def render_analyze_step():
     file = st.file_uploader("", type=["png", "jpg", "jpeg"])
 
     if not file:
-        st.info("写真 → 自動で正対補正＆候補点 → 不要な点を消す/足す → Analyze（スコアも出ます）")
+        st.info("写真 → 自動で正対補正＆リング推定＆候補点 → 不要な点を消す/足す → Analyze（スコアも出ます）")
         return
 
     img_pil = Image.open(file).convert("RGB")
@@ -106,8 +104,13 @@ def render_analyze_step():
     if st.session_state.get("cv_cache_key") != cache_key:
         rect_res = rectify_target(img_rgb, out_size=900)
 
-        # ring geometry
-        rings = ring_radii_px(rect_res.outer_radius, st.session_state.target_face)
+        # ring detection using color+edges, fallback inside function
+        rings, ring_dbg = detect_ring_radii(
+            rect_res.rect_bgr,
+            rect_res.center,
+            rect_res.outer_radius,
+            st.session_state.target_face
+        )
 
         # propose points
         auto_pts = propose_hit_points(
@@ -117,7 +120,7 @@ def render_analyze_step():
             max_points=12
         )
 
-        # overlay (with rings only; hits drawn after user confirms)
+        # overlay with rings only (keep original colors)
         overlay = draw_overlay(
             rect_res.rect_bgr,
             rect_res.center,
@@ -126,8 +129,11 @@ def render_analyze_step():
             scores=[],
         )
 
+        debug = dict(rect_res.debug)
+        debug.update({"ring_debug": ring_dbg})
+
         st.session_state.cv_cache_key = cache_key
-        st.session_state.warp_debug = rect_res.debug
+        st.session_state.warp_debug = debug
         st.session_state.warped_image_rgb = _bgr_to_rgb_uint8(rect_res.rect_bgr)
         st.session_state.overlay_image_rgb = _bgr_to_rgb_uint8(overlay)
         st.session_state.auto_points = auto_pts
@@ -148,7 +154,7 @@ def render_analyze_step():
     arrow_present = st.session_state._geom_arrow_present
 
     st.subheader(t("tap_points", lang))
-    st.caption("黄色い円＝リング（計算基準） / 赤点＝候補。不要なら削除、足りなければ追加。")
+    st.caption("リング線＝控えめな黒線（写真の色は維持） / 赤点＝候補。不要なら削除、足りなければ追加。")
 
     with st.expander("CV debug"):
         st.write(st.session_state.warp_debug)
@@ -187,17 +193,14 @@ def render_analyze_step():
             st.warning(t("need_points", lang))
             return
 
-        # Use first N points
         pts_xy = [(p["x"], p["y"]) for p in points[:need]]
-
         scoring = score_hits(center, outer, pts_xy)
 
-        # metrics for coaching logic
         metrics = compute_metrics(points[:need])
         shape = classify_shape(metrics)
         advice = next_end_advice(metrics, shape, st.session_state.handedness)
 
-        # draw overlay with hits+scores
+        # redraw overlay with hits + scores (still preserve colors)
         rect_bgr = cv2.cvtColor(st.session_state.warped_image_rgb, cv2.COLOR_RGB2BGR)
         overlay2 = draw_overlay(rect_bgr, center, rings, pts_xy, scoring["scores"])
         overlay2_rgb = _bgr_to_rgb_uint8(overlay2)
