@@ -11,8 +11,13 @@ from .metrics import compute_metrics, classify_shape
 from .rules import next_end_advice
 from .storage import make_log_entry, export_log_json
 from .cv_target import rectify_target, propose_hit_points
-from .scoring import score_hits, ring_radii_px
+from .scoring import score_hits
 from .target_face import render_target_face_bgr
+
+
+CANON_SIZE = 900
+CANON_CENTER = (CANON_SIZE / 2.0, CANON_SIZE / 2.0)
+CANON_OUTER = CANON_SIZE * 0.45  # 405 px
 
 
 def _bgr_to_rgb_uint8(bgr: np.ndarray) -> np.ndarray:
@@ -48,13 +53,28 @@ def _extract_points_from_canvas(json_data: dict):
     return pts
 
 
+def _map_points_to_canon(points_xy, src_center, src_outer):
+    """
+    Map points from rectified-photo coords -> canonical face coords.
+    x' = Cc + (x - Cs) * (Rc / Rs)
+    """
+    if src_outer <= 1e-6:
+        return points_xy
+    sx, sy = src_center
+    cx, cy = CANON_CENTER
+    scale = CANON_OUTER / float(src_outer)
+    out = []
+    for (x, y) in points_xy:
+        out.append((cx + (x - sx) * scale, cy + (y - sy) * scale))
+    return out
+
+
 def _draw_hits_on_face(face_bgr, points_xy, scores):
-    """Draw hit points + scores on the clean face (no color tint)."""
     img = face_bgr.copy()
     for i, (x, y) in enumerate(points_xy):
-        px, py = int(x), int(y)
-        cv2.circle(img, (px, py), 10, (0, 0, 255), 2)   # red ring
-        cv2.circle(img, (px, py), 2, (0, 0, 255), -1)   # red center dot
+        px, py = int(round(x)), int(round(y))
+        cv2.circle(img, (px, py), 10, (0, 0, 255), 2)
+        cv2.circle(img, (px, py), 2, (0, 0, 255), -1)
         if i < len(scores):
             s = scores[i]
             cv2.putText(
@@ -122,48 +142,47 @@ def render_analyze_step():
     cache_key = f"{getattr(file, 'name', 'upload')}-{img_rgb.shape[0]}x{img_rgb.shape[1]}"
     need = int(st.session_state.arrows_per_end)
 
-    # --- run CV once per upload
     if st.session_state.get("cv_cache_key") != cache_key:
-        rect_res = rectify_target(img_rgb, out_size=900)
+        rect_res = rectify_target(img_rgb, out_size=CANON_SIZE)
 
-        # Standard rings (geometry) — black lines will be drawn on template
-        rings = ring_radii_px(rect_res.outer_radius, st.session_state.target_face)
-
-        # Clean standard face background
+        # Clean standard face background uses CANON geometry (NOT CV geometry)
         face_bgr = render_target_face_bgr(
             st.session_state.target_face,
-            size=900,
-            center=rect_res.center,
-            outer_radius=rect_res.outer_radius,
+            size=CANON_SIZE,
+            center=CANON_CENTER,
+            outer_radius=CANON_OUTER,
             draw_ring_lines=True,
             ring_line_thickness=2,
         )
 
-        # Propose hit candidates (still from rectified photo)
-        auto_pts = propose_hit_points(
+        # Propose points from rectified photo, then map to canonical
+        auto_pts_src = propose_hit_points(
             rect_res.rect_bgr,
             rect_res.center,
             rect_res.arrow_present,
             max_points=12
         )
+        auto_pts = _map_points_to_canon(auto_pts_src, rect_res.center, rect_res.outer_radius)
 
         st.session_state.cv_cache_key = cache_key
-        st.session_state.warp_debug = rect_res.debug
+        st.session_state.warp_debug = {
+            **rect_res.debug,
+            "canon_center": CANON_CENTER,
+            "canon_outer": CANON_OUTER,
+        }
 
-        # For point confirmation UI we use clean face
         st.session_state.overlay_image_rgb = _bgr_to_rgb_uint8(face_bgr)
         st.session_state.auto_points = auto_pts
         st.session_state.points = []
         st.session_state.last_result = None
 
-        # store geometry
-        st.session_state._geom_center = rect_res.center
-        st.session_state._geom_outer = rect_res.outer_radius
-        st.session_state._geom_rings = rings
-        st.session_state._geom_arrow_present = rect_res.arrow_present
+        # canonical geometry for scoring
+        st.session_state._geom_center = CANON_CENTER
+        st.session_state._geom_outer = CANON_OUTER
 
-        # keep rectified photo only for debug display (optional)
+        # keep rectified photo only for debug
         st.session_state._rect_photo_rgb = _bgr_to_rgb_uint8(rect_res.rect_bgr)
+        st.session_state._geom_arrow_present = rect_res.arrow_present
 
     bg_rgb = st.session_state.overlay_image_rgb
     auto_pts = st.session_state.auto_points
@@ -172,9 +191,9 @@ def render_analyze_step():
     arrow_present = st.session_state._geom_arrow_present
 
     st.subheader(t("tap_points", lang))
-    st.caption("Background is a clean standard target face. Ring lines are black. Confirm / add / delete hit points.")
+    st.caption("Background is a clean standard target face (correct colors). Ring lines are black. Confirm / add / delete hit points.")
 
-    with st.expander("CV debug (photo is not used as background)"):
+    with st.expander("CV debug"):
         st.write(st.session_state.warp_debug)
         st.write({"arrow_present": arrow_present, "need_points": need})
         st.image(st.session_state._rect_photo_rgb, caption="Rectified photo (debug only)", use_column_width=False)
@@ -212,15 +231,15 @@ def render_analyze_step():
             return
 
         pts_xy = [(p["x"], p["y"]) for p in points[:need]]
+
+        # scoring uses canonical center/outer -> stable
         scoring = score_hits(center, outer, pts_xy)
 
         metrics = compute_metrics(points[:need])
         shape = classify_shape(metrics)
 
-        # IMPORTANT: advice language follows UI language now
         advice = next_end_advice(metrics, shape, st.session_state.handedness, lang=lang)
 
-        # Draw result overlay on a fresh clean face
         face_bgr = cv2.cvtColor(bg_rgb, cv2.COLOR_RGB2BGR)
         overlay_hits = _draw_hits_on_face(face_bgr, pts_xy, scoring["scores"])
         overlay_hits_rgb = _bgr_to_rgb_uint8(overlay_hits)
