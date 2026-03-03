@@ -10,8 +10,9 @@ from .state import goto_step, reset_shot, reset_cv_cache
 from .metrics import compute_metrics, classify_shape
 from .rules import next_end_advice
 from .storage import make_log_entry, export_log_json
-from .cv_target import rectify_target, propose_hit_points, draw_overlay, detect_ring_radii
-from .scoring import score_hits
+from .cv_target import rectify_target, propose_hit_points
+from .scoring import score_hits, ring_radii_px
+from .target_face import render_target_face_bgr
 
 
 def _bgr_to_rgb_uint8(bgr: np.ndarray) -> np.ndarray:
@@ -47,11 +48,32 @@ def _extract_points_from_canvas(json_data: dict):
     return pts
 
 
+def _draw_hits_on_face(face_bgr, points_xy, scores):
+    """Draw hit points + scores on the clean face (no color tint)."""
+    img = face_bgr.copy()
+    for i, (x, y) in enumerate(points_xy):
+        px, py = int(x), int(y)
+        cv2.circle(img, (px, py), 10, (0, 0, 255), 2)   # red ring
+        cv2.circle(img, (px, py), 2, (0, 0, 255), -1)   # red center dot
+        if i < len(scores):
+            s = scores[i]
+            cv2.putText(
+                img,
+                str(s),
+                (px + 12, py - 12),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+    return img
+
+
 def render_analyze_step():
     lang = st.session_state.language
     st.title(t("title", lang))
 
-    # --- controls
     top1, top2, top3 = st.columns([1, 1, 1.4])
     with top1:
         st.session_state.distance_m = st.number_input(
@@ -73,7 +95,7 @@ def render_analyze_step():
         if face != st.session_state.target_face:
             st.session_state.target_face = face
             st.session_state.last_result = None
-            st.session_state.overlay_image_rgb = None  # ring overlay depends on detection
+            st.session_state.overlay_image_rgb = None
 
     colA, colB = st.columns([1, 1])
     with colA:
@@ -91,7 +113,7 @@ def render_analyze_step():
     file = st.file_uploader("", type=["png", "jpg", "jpeg"])
 
     if not file:
-        st.info("写真 → 自動で正対補正＆リング推定＆候補点 → 不要な点を消す/足す → Analyze（スコアも出ます）")
+        st.info("Upload → rectify → auto candidates → confirm points → analyze (score + cue)")
         return
 
     img_pil = Image.open(file).convert("RGB")
@@ -100,19 +122,24 @@ def render_analyze_step():
     cache_key = f"{getattr(file, 'name', 'upload')}-{img_rgb.shape[0]}x{img_rgb.shape[1]}"
     need = int(st.session_state.arrows_per_end)
 
-    # --- Run CV only when new upload
+    # --- run CV once per upload
     if st.session_state.get("cv_cache_key") != cache_key:
         rect_res = rectify_target(img_rgb, out_size=900)
 
-        # ring detection using color+edges, fallback inside function
-        rings, ring_dbg = detect_ring_radii(
-            rect_res.rect_bgr,
-            rect_res.center,
-            rect_res.outer_radius,
-            st.session_state.target_face
+        # Standard rings (geometry) — black lines will be drawn on template
+        rings = ring_radii_px(rect_res.outer_radius, st.session_state.target_face)
+
+        # Clean standard face background
+        face_bgr = render_target_face_bgr(
+            st.session_state.target_face,
+            size=900,
+            center=rect_res.center,
+            outer_radius=rect_res.outer_radius,
+            draw_ring_lines=True,
+            ring_line_thickness=2,
         )
 
-        # propose points
+        # Propose hit candidates (still from rectified photo)
         auto_pts = propose_hit_points(
             rect_res.rect_bgr,
             rect_res.center,
@@ -120,47 +147,38 @@ def render_analyze_step():
             max_points=12
         )
 
-        # overlay with rings only (keep original colors)
-        overlay = draw_overlay(
-            rect_res.rect_bgr,
-            rect_res.center,
-            rings,
-            points_xy=[],
-            scores=[],
-        )
-
-        debug = dict(rect_res.debug)
-        debug.update({"ring_debug": ring_dbg})
-
         st.session_state.cv_cache_key = cache_key
-        st.session_state.warp_debug = debug
-        st.session_state.warped_image_rgb = _bgr_to_rgb_uint8(rect_res.rect_bgr)
-        st.session_state.overlay_image_rgb = _bgr_to_rgb_uint8(overlay)
+        st.session_state.warp_debug = rect_res.debug
+
+        # For point confirmation UI we use clean face
+        st.session_state.overlay_image_rgb = _bgr_to_rgb_uint8(face_bgr)
         st.session_state.auto_points = auto_pts
         st.session_state.points = []
         st.session_state.last_result = None
 
-        # store geometry for scoring
+        # store geometry
         st.session_state._geom_center = rect_res.center
         st.session_state._geom_outer = rect_res.outer_radius
         st.session_state._geom_rings = rings
         st.session_state._geom_arrow_present = rect_res.arrow_present
 
-    overlay_rgb = st.session_state.overlay_image_rgb
+        # keep rectified photo only for debug display (optional)
+        st.session_state._rect_photo_rgb = _bgr_to_rgb_uint8(rect_res.rect_bgr)
+
+    bg_rgb = st.session_state.overlay_image_rgb
     auto_pts = st.session_state.auto_points
     center = st.session_state._geom_center
     outer = st.session_state._geom_outer
-    rings = st.session_state._geom_rings
     arrow_present = st.session_state._geom_arrow_present
 
     st.subheader(t("tap_points", lang))
-    st.caption("リング線＝控えめな黒線（写真の色は維持） / 赤点＝候補。不要なら削除、足りなければ追加。")
+    st.caption("Background is a clean standard target face. Ring lines are black. Confirm / add / delete hit points.")
 
-    with st.expander("CV debug"):
+    with st.expander("CV debug (photo is not used as background)"):
         st.write(st.session_state.warp_debug)
         st.write({"arrow_present": arrow_present, "need_points": need})
+        st.image(st.session_state._rect_photo_rgb, caption="Rectified photo (debug only)", use_column_width=False)
 
-    # Pre-fill canvas with candidates if user hasn't edited yet
     initial = None
     if not st.session_state.points:
         initial = _points_to_initial_drawing(auto_pts[:need], r=10)
@@ -169,7 +187,7 @@ def render_analyze_step():
         fill_color="rgba(255, 0, 0, 0.25)",
         stroke_width=3,
         stroke_color="rgba(255, 0, 0, 0.9)",
-        background_image=Image.fromarray(overlay_rgb),
+        background_image=Image.fromarray(bg_rgb),
         update_streamlit=True,
         height=700,
         width=700,
@@ -198,19 +216,21 @@ def render_analyze_step():
 
         metrics = compute_metrics(points[:need])
         shape = classify_shape(metrics)
-        advice = next_end_advice(metrics, shape, st.session_state.handedness)
 
-        # redraw overlay with hits + scores (still preserve colors)
-        rect_bgr = cv2.cvtColor(st.session_state.warped_image_rgb, cv2.COLOR_RGB2BGR)
-        overlay2 = draw_overlay(rect_bgr, center, rings, pts_xy, scoring["scores"])
-        overlay2_rgb = _bgr_to_rgb_uint8(overlay2)
+        # IMPORTANT: advice language follows UI language now
+        advice = next_end_advice(metrics, shape, st.session_state.handedness, lang=lang)
+
+        # Draw result overlay on a fresh clean face
+        face_bgr = cv2.cvtColor(bg_rgb, cv2.COLOR_RGB2BGR)
+        overlay_hits = _draw_hits_on_face(face_bgr, pts_xy, scoring["scores"])
+        overlay_hits_rgb = _bgr_to_rgb_uint8(overlay_hits)
 
         st.session_state.last_result = {
             "metrics": metrics,
             "shape": shape,
             "advice": advice,
             "scoring": scoring,
-            "overlay_hits_rgb": overlay2_rgb,
+            "overlay_hits_rgb": overlay_hits_rgb,
         }
         st.rerun()
 
@@ -221,29 +241,29 @@ def render_analyze_step():
         scoring = res["scoring"]
 
         st.divider()
-        st.subheader("Overlay（リング + 命中 + 点数）")
+        st.subheader("Overlay (standard face + hits + scores)")
         st.image(res["overlay_hits_rgb"], use_column_width=False)
 
-        st.subheader("スコア")
+        st.subheader("Score")
         st.write(f"- Total: **{scoring['total']}** / {need * 10}")
         st.write(f"- Avg: **{scoring['avg']:.2f}**")
         st.write(f"- Per arrow: {scoring['scores']}")
 
-        st.subheader("グルーピング指標（参考）")
+        st.subheader("Grouping metrics (reference)")
         st.write(f"- Shape: **{res['shape']}**")
         st.write(f"- Spread (avg): **{metrics['spread']:.1f} px**")
         st.write(f"- sx / sy: **{metrics['sx']:.1f} / {metrics['sy']:.1f}**")
         st.write(f"- Direction: **{metrics['slope_deg']:.0f}°**")
 
-        st.subheader("次のエンド：ワンキュー")
+        st.subheader("Next end cue")
         st.markdown(f"**{advice['title']}**")
         st.markdown(f"👉 {advice['cue']}")
-        with st.expander("理由（短く）"):
+        with st.expander("Why"):
             st.write(advice["why"])
 
     if save_clicked:
         if not st.session_state.last_result:
-            st.warning("先に分析してください。")
+            st.warning("Analyze first.")
             return
 
         entry = make_log_entry(
@@ -256,11 +276,11 @@ def render_analyze_step():
             advice=st.session_state.last_result["advice"],
         )
         st.session_state.log.append(entry)
-        st.success("保存しました。")
+        st.success("Saved.")
 
     if st.session_state.log:
         st.divider()
-        st.subheader("ログ")
+        st.subheader("Log")
         json_text = export_log_json(st.session_state.log)
         st.download_button(
             label="Download log.json",
