@@ -38,6 +38,7 @@ def classify_shape(metrics: Dict[str, float]) -> str:
 
     sx = float(metrics.get("sx", 0.0))
     sy = float(metrics.get("sy", 0.0))
+
     if sx < 1e-6 and sy < 1e-6:
         return "tight"
 
