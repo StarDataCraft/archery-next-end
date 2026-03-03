@@ -1,4 +1,3 @@
-from .refine_points import refine_points
 import streamlit as st
 from PIL import Image
 import numpy as np
@@ -14,6 +13,7 @@ from .storage import make_log_entry, export_log_json
 from .cv_target import rectify_target, propose_hit_points
 from .scoring import score_hits
 from .target_face import render_target_face_bgr
+from .refine_points import refine_points
 
 
 CANON_SIZE = 900
@@ -71,11 +71,15 @@ def _map_points_to_canon(points_xy, src_center, src_outer):
 
 
 def _draw_hits_on_face(face_bgr, points_xy, scores):
+    """Draw hit points + scores on the clean face (no color tint)."""
     img = face_bgr.copy()
+    PURPLE = (255, 0, 255)  # BGR
+
     for i, (x, y) in enumerate(points_xy):
         px, py = int(round(x)), int(round(y))
-        cv2.circle(img, (px, py), 10, (0, 0, 255), 2)
-        cv2.circle(img, (px, py), 2, (0, 0, 255), -1)
+        cv2.circle(img, (px, py), 10, PURPLE, 2)   # purple ring
+        cv2.circle(img, (px, py), 2, PURPLE, -1)   # purple dot
+
         if i < len(scores):
             s = scores[i]
             cv2.putText(
@@ -156,20 +160,33 @@ def render_analyze_step():
             ring_line_thickness=2,
         )
 
-        # Propose points from rectified photo, then map to canonical
+        # Propose points from rectified photo
         auto_pts_src = propose_hit_points(
             rect_res.rect_bgr,
             rect_res.center,
             rect_res.arrow_present,
             max_points=12
         )
-        auto_pts = _map_points_to_canon(auto_pts_src, rect_res.center, rect_res.outer_radius)
+
+        # NEW: automatic refinement (no user help)
+        auto_pts_refined = refine_points(
+            rect_res.rect_bgr,
+            rect_res.center,
+            auto_pts_src,
+            arrow_present=rect_res.arrow_present,
+            roi_radius=45,
+        )
+
+        # map refined points into canonical
+        auto_pts = _map_points_to_canon(auto_pts_refined, rect_res.center, rect_res.outer_radius)
 
         st.session_state.cv_cache_key = cache_key
         st.session_state.warp_debug = {
             **rect_res.debug,
             "canon_center": CANON_CENTER,
             "canon_outer": CANON_OUTER,
+            "auto_pts_src": auto_pts_src,
+            "auto_pts_refined": auto_pts_refined,
         }
 
         st.session_state.overlay_image_rgb = _bgr_to_rgb_uint8(face_bgr)
@@ -239,6 +256,7 @@ def render_analyze_step():
         metrics = compute_metrics(points[:need])
         shape = classify_shape(metrics)
 
+        # Advice language follows UI language
         advice = next_end_advice(metrics, shape, st.session_state.handedness, lang=lang)
 
         face_bgr = cv2.cvtColor(bg_rgb, cv2.COLOR_RGB2BGR)
