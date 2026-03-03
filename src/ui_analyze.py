@@ -83,6 +83,20 @@ def _canon_to_rect_points(points_xy, M_rect_to_canon):
     """
     if not points_xy:
         return []
+
+    if M_rect_to_canon is None:
+        raise TypeError("M_rect_to_canon is None (cannot invert affine transform).")
+
+    # Accept list -> np.array
+    if not isinstance(M_rect_to_canon, np.ndarray):
+        try:
+            M_rect_to_canon = np.array(M_rect_to_canon, dtype=np.float32)
+        except Exception as e:
+            raise TypeError(f"M_rect_to_canon cannot be converted to np.ndarray: {type(M_rect_to_canon)}") from e
+
+    if M_rect_to_canon.shape != (2, 3):
+        raise TypeError(f"M_rect_to_canon must be shape (2,3), got {M_rect_to_canon.shape}")
+
     Minv = cv2.invertAffineTransform(M_rect_to_canon.astype(np.float32))
     pts = np.array(points_xy, dtype=np.float32).reshape(-1, 1, 2)
     out = cv2.transform(pts, Minv).reshape(-1, 2)
@@ -233,46 +247,77 @@ def render_analyze_step():
         save_clicked = st.button(t("save_log", lang), use_container_width=True)
 
     if analyze_clicked:
-        if len(points) < need:
-            st.warning(t("need_points", lang))
-            return
+        try:
+            if len(points) < need:
+                st.warning(t("need_points", lang))
+                return
 
-        pts_xy = [(p["x"], p["y"]) for p in points[:need]]
+            pts_xy = [(p["x"], p["y"]) for p in points[:need]]
 
-        # ---- NEW: sample contact HSV on rectified photo at the corresponding rect point ----
-        rect_bgr = st.session_state._rect_photo_bgr
-        M_rect_to_canon = st.session_state._M_rect_to_canon
+            rect_bgr = st.session_state._rect_photo_bgr
+            M_rect_to_canon = st.session_state._M_rect_to_canon
 
-        rect_pts = _canon_to_rect_points(pts_xy, M_rect_to_canon)
-        hsvs = [sample_contact_color_hsv(rect_bgr, rp, roi_radius=18) for rp in rect_pts]
+            # ---- DEBUG: print types + small examples ----
+            with st.expander("DEBUG (types + samples)", expanded=True):
+                st.write("type(pts_xy):", type(pts_xy))
+                st.write("pts_xy[:1]:", pts_xy[:1])
+                st.write("type(rect_bgr):", type(rect_bgr), "shape:", getattr(rect_bgr, "shape", None))
+                st.write("type(M_rect_to_canon):", type(M_rect_to_canon))
+                st.write("M_rect_to_canon shape:", getattr(M_rect_to_canon, "shape", None))
 
-        scoring = score_hits_color_aware(center, outer, pts_xy, contact_hsvs=hsvs)
+            rect_pts = _canon_to_rect_points(pts_xy, M_rect_to_canon)
 
-        metrics = compute_metrics(points[:need], center=center, outer_radius_px=outer)
-        shape = classify_shape(metrics)
+            with st.expander("DEBUG (rect pts + hsv)", expanded=False):
+                st.write("rect_pts[:2]:", rect_pts[:2])
 
-        advice = next_end_advice(
-            metrics,
-            shape,
-            st.session_state.handedness,
-            lang=lang,
-            quality=quality,
-        )
+            # sample_contact_color_hsv signature may differ across your local versions.
+            # Support both:
+            #   sample_contact_color_hsv(rect_bgr, (x,y), roi_radius=18)
+            #   sample_contact_color_hsv(rect_bgr, x, y, r=10)
+            hsvs = []
+            for rp in rect_pts:
+                try:
+                    hsv = sample_contact_color_hsv(rect_bgr, rp, roi_radius=18)  # (bgr, (x,y), roi_radius=?)
+                except TypeError:
+                    hsv = sample_contact_color_hsv(rect_bgr, rp[0], rp[1], r=10)  # (bgr, x, y, r=?)
+                hsvs.append(hsv)
 
-        face_bgr = cv2.cvtColor(bg_rgb, cv2.COLOR_RGB2BGR)
-        overlay_hits = _draw_hits_on_face(face_bgr, pts_xy, scoring["scores"])
-        overlay_hits_rgb = _bgr_to_rgb_uint8(overlay_hits)
+            with st.expander("DEBUG (hsv samples)", expanded=False):
+                st.write("hsvs[:2]:", hsvs[:2])
+                st.write("hsv element types:", [type(x).__name__ for x in hsvs[:5]])
 
-        st.session_state.last_result = {
-            "metrics": metrics,
-            "shape": shape,
-            "advice": advice,
-            "scoring": scoring,
-            "overlay_hits_rgb": overlay_hits_rgb,
-            "quality": quality,
-            "color_debug": scoring.get("details", []),
-        }
-        st.rerun()
+            scoring = score_hits_color_aware(center, outer, pts_xy, contact_hsvs=hsvs)
+
+            metrics = compute_metrics(points[:need], center=center, outer_radius_px=outer)
+            shape = classify_shape(metrics)
+
+            advice = next_end_advice(
+                metrics,
+                shape,
+                st.session_state.handedness,
+                lang=lang,
+                quality=quality,
+            )
+
+            face_bgr = cv2.cvtColor(bg_rgb, cv2.COLOR_RGB2BGR)
+            overlay_hits = _draw_hits_on_face(face_bgr, pts_xy, scoring["scores"])
+            overlay_hits_rgb = _bgr_to_rgb_uint8(overlay_hits)
+
+            st.session_state.last_result = {
+                "metrics": metrics,
+                "shape": shape,
+                "advice": advice,
+                "scoring": scoring,
+                "overlay_hits_rgb": overlay_hits_rgb,
+                "quality": quality,
+                "color_debug": scoring.get("details", []),
+            }
+            st.rerun()
+
+        except Exception as e:
+            st.error("Analyze crashed. Full traceback below:")
+            st.exception(e)  # shows full traceback in the UI
+            st.stop()
 
     if st.session_state.last_result:
         res = st.session_state.last_result
