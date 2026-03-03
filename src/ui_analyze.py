@@ -10,7 +10,7 @@ from .state import goto_step, reset_shot, reset_cv_cache
 from .metrics import compute_metrics, classify_shape
 from .rules import next_end_advice
 from .storage import make_log_entry, export_log_json
-from .cv_target import rectify_target, transform_points
+from .cv_target import rectify_target, transform_points, propose_hit_points
 from .refine_points import refine_points_and_colors
 from .scoring import score_hits
 from .target_face import render_target_face_bgr
@@ -34,8 +34,8 @@ def _points_to_initial_drawing(points, r=10):
             "left": float(x - r),
             "top": float(y - r),
             "radius": float(r),
-            "fill": "rgba(180, 0, 255, 0.22)",   # purple-ish fill
-            "stroke": "rgba(180, 0, 255, 0.95)", # purple stroke
+            "fill": "rgba(180, 0, 255, 0.22)",
+            "stroke": "rgba(180, 0, 255, 0.95)",
             "strokeWidth": 2,
         })
     return {"version": "4.4.0", "objects": objects}
@@ -57,12 +57,10 @@ def _extract_points_from_canvas(json_data: dict):
 def _draw_hits_on_face(face_bgr, points_xy, scores):
     img = face_bgr.copy()
     PURPLE = (255, 0, 255)  # BGR
-
     for i, (x, y) in enumerate(points_xy):
         px, py = int(round(x)), int(round(y))
         cv2.circle(img, (px, py), 10, PURPLE, 2)
         cv2.circle(img, (px, py), 2, PURPLE, -1)
-
         if i < len(scores):
             s = scores[i]
             cv2.putText(
@@ -121,7 +119,7 @@ def render_analyze_step():
     file = st.file_uploader("", type=["png", "jpg", "jpeg"])
 
     if not file:
-        st.info("Upload → rectify → (target pose) → arrow contact points → confirm → analyze")
+        st.info("Upload → pose(rectify) → propose tips → refine contact → map to canonical → confirm → analyze")
         return
 
     img_pil = Image.open(file).convert("RGB")
@@ -131,10 +129,8 @@ def render_analyze_step():
     need = int(st.session_state.arrows_per_end)
 
     if st.session_state.get("cv_cache_key") != cache_key:
-        # 1) rectify target + detect midline + detect X + build mapping matrix
         rect_res = rectify_target(img_rgb, out_size=CANON_SIZE)
 
-        # 2) render clean canonical face
         face_bgr = render_target_face_bgr(
             st.session_state.target_face,
             size=CANON_SIZE,
@@ -144,29 +140,26 @@ def render_analyze_step():
             ring_line_thickness=2,
         )
 
-        # 3) propose coarse points (still via your existing coarse method)
-        #    We intentionally do: target pose first (rectify_target already done),
-        #    then arrow contact detection/refine here.
-        #    coarse points should exist; we can seed with a simple heuristic:
-        #    use multiple line endpoints by calling refine_points directly on a simple seed:
-        #    (we use a few center-biased seeds to force detection in presence of arrows)
-        # For robustness, we use a small seed set around center; refine_points will snap to arrow lines.
-        seeds = []
-        cfx, cfy = rect_res.center_final
-        for dx, dy in [(0, 0), (30, 0), (-30, 0), (0, 30), (0, -30), (45, 25), (-45, 25)]:
-            seeds.append((cfx + dx, cfy + dy))
+        # 1) global candidates from arrow shafts / blobs
+        coarse = propose_hit_points(
+            rect_res.rect_bgr,
+            rect_res.center_final,
+            rect_res.arrow_present,
+            max_points=max(need, 12),
+        )
 
+        # 2) refine -> contact point + face color estimate
         refined_rect_pts, contact_colors = refine_points_and_colors(
             rect_res.rect_bgr,
             target_center=rect_res.center_final,
-            coarse_points=seeds,
+            coarse_points=coarse,
             arrow_present=rect_res.arrow_present,
-            roi_radius=75,
+            roi_radius=70,
         )
 
-        # de-duplicate refined points (in rect coords)
+        # de-dup refined points
         dedup = []
-        dedup_colors = []
+        dedup_cols = []
         min_d2 = 18.0 ** 2
         for p, col in zip(refined_rect_pts, contact_colors):
             ok = True
@@ -176,24 +169,21 @@ def render_analyze_step():
                     break
             if ok:
                 dedup.append(p)
-                dedup_colors.append(col)
+                dedup_cols.append(col)
 
-        # 4) map rect points -> canonical
+        # 3) map to canonical using pose matrix (critical)
         auto_pts_canon = transform_points(dedup, rect_res.M_rect_to_canon)
 
         st.session_state.cv_cache_key = cache_key
         st.session_state.overlay_image_rgb = _bgr_to_rgb_uint8(face_bgr)
-
         st.session_state.auto_points = auto_pts_canon
-        st.session_state.auto_contact_colors = dedup_colors
+        st.session_state.auto_contact_colors = dedup_cols
         st.session_state.points = []
         st.session_state.last_result = None
 
-        # canonical geometry for scoring
         st.session_state._geom_center = CANON_CENTER
         st.session_state._geom_outer = CANON_OUTER
 
-        # debug
         st.session_state._rect_photo_rgb = _bgr_to_rgb_uint8(rect_res.rect_bgr)
         st.session_state.warp_debug = rect_res.debug
 
@@ -203,14 +193,14 @@ def render_analyze_step():
     outer = st.session_state._geom_outer
 
     st.subheader(t("tap_points", lang))
-    st.caption("We detect target pose first (midline/X), then find arrow-to-face contact points automatically. Confirm / add / delete.")
+    st.caption("Pose first (midline/X + circle refine) → then contact points. Purple = hits.")
 
-    with st.expander("CV debug (pose + contact color)"):
+    with st.expander("CV debug (pose + color)"):
         st.write(st.session_state.warp_debug)
         st.image(st.session_state._rect_photo_rgb, caption="Rectified photo (debug)", use_column_width=False)
         cols = st.session_state.get("auto_contact_colors", [])
         if cols:
-            st.write({"contact_colors_preview": cols[: min(10, len(cols))]})
+            st.write({"contact_face_color_preview": cols[: min(10, len(cols))]})
 
     initial = None
     if not st.session_state.points:
@@ -249,7 +239,6 @@ def render_analyze_step():
         scoring = score_hits(center, outer, pts_xy)
         metrics = compute_metrics(points[:need])
         shape = classify_shape(metrics)
-
         advice = next_end_advice(metrics, shape, st.session_state.handedness, lang=lang)
 
         face_bgr = cv2.cvtColor(bg_rgb, cv2.COLOR_RGB2BGR)
@@ -267,9 +256,9 @@ def render_analyze_step():
 
     if st.session_state.last_result:
         res = st.session_state.last_result
-        advice = res["advice"]
         metrics = res["metrics"]
         scoring = res["scoring"]
+        advice = res["advice"]
 
         st.divider()
         st.subheader("Overlay (standard face + hits + scores)")
