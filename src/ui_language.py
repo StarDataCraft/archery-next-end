@@ -1,18 +1,20 @@
 import streamlit as st
-from .i18n import t
 from .state import goto_step
-
+from .i18n import t
 
 def render_language_step():
-    st.title("Archery Next End")
-    lang = st.selectbox(
-        t("choose_language", "en"),
-        options=["en", "ja", "zh"],
-        format_func=lambda x: {"en": "English", "ja": "日本語", "zh": "中文"}[x],
-        index=["en", "ja", "zh"].index(st.session_state.language),
+    st.title(t("choose_language", st.session_state.language))
+
+    lang = st.radio(
+        label="",
+        options=["ja", "en", "zh"],
+        format_func=lambda x: {"ja": "日本語", "en": "English", "zh": "中文"}[x],
+        index=["ja", "en", "zh"].index(st.session_state.language),
     )
     st.session_state.language = lang
 
-    if st.button(t("next", lang), use_container_width=True):
-        goto_step("handedness")
-        st.rerun()
+    col1, col2 = st.columns([1, 1])
+    with col2:
+        if st.button(t("next", lang), use_container_width=True):
+            goto_step("handedness")
+            st.rerun()
