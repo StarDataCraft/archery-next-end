@@ -1,8 +1,8 @@
+# src/ui_analyze.py
 import streamlit as st
 from PIL import Image
 import numpy as np
 import cv2
-
 from streamlit_drawable_canvas import st_canvas
 
 from .i18n import t
@@ -14,7 +14,6 @@ from .cv_target import rectify_target, transform_points, propose_hit_points
 from .refine_points import refine_points_and_colors
 from .scoring import score_hits
 from .target_face import render_target_face_bgr
-
 
 CANON_SIZE = 900
 CANON_CENTER = (CANON_SIZE / 2.0, CANON_SIZE / 2.0)
@@ -29,15 +28,17 @@ def _bgr_to_rgb_uint8(bgr: np.ndarray) -> np.ndarray:
 def _points_to_initial_drawing(points, r=10):
     objects = []
     for (x, y) in points:
-        objects.append({
-            "type": "circle",
-            "left": float(x - r),
-            "top": float(y - r),
-            "radius": float(r),
-            "fill": "rgba(180, 0, 255, 0.22)",
-            "stroke": "rgba(180, 0, 255, 0.95)",
-            "strokeWidth": 2,
-        })
+        objects.append(
+            {
+                "type": "circle",
+                "left": float(x - r),
+                "top": float(y - r),
+                "radius": float(r),
+                "fill": "rgba(180, 0, 255, 0.22)",
+                "stroke": "rgba(180, 0, 255, 0.95)",
+                "strokeWidth": 2,
+            }
+        )
     return {"version": "4.4.0", "objects": objects}
 
 
@@ -83,13 +84,19 @@ def render_analyze_step():
     top1, top2, top3 = st.columns([1, 1, 1.4])
     with top1:
         st.session_state.distance_m = st.number_input(
-            t("distance", lang), min_value=3, max_value=90,
-            value=int(st.session_state.distance_m), step=1
+            t("distance", lang),
+            min_value=3,
+            max_value=90,
+            value=int(st.session_state.distance_m),
+            step=1,
         )
     with top2:
         st.session_state.arrows_per_end = st.number_input(
-            t("arrows", lang), min_value=3, max_value=12,
-            value=int(st.session_state.arrows_per_end), step=1
+            t("arrows", lang),
+            min_value=3,
+            max_value=12,
+            value=int(st.session_state.arrows_per_end),
+            step=1,
         )
     with top3:
         face = st.selectbox(
@@ -117,14 +124,12 @@ def render_analyze_step():
     st.divider()
     st.subheader(t("upload", lang))
     file = st.file_uploader("", type=["png", "jpg", "jpeg"])
-
     if not file:
         st.info("Upload → pose(rectify) → propose tips → refine contact → map to canonical → confirm → analyze")
         return
 
     img_pil = Image.open(file).convert("RGB")
     img_rgb = np.array(img_pil, dtype=np.uint8)
-
     cache_key = f"{getattr(file, 'name', 'upload')}-{img_rgb.shape[0]}x{img_rgb.shape[1]}"
     need = int(st.session_state.arrows_per_end)
 
@@ -140,7 +145,7 @@ def render_analyze_step():
             ring_line_thickness=2,
         )
 
-        # 1) global candidates from arrow shafts / blobs
+        # 1) global candidates
         coarse = propose_hit_points(
             rect_res.rect_bgr,
             rect_res.center_final,
@@ -148,7 +153,7 @@ def render_analyze_step():
             max_points=max(need, 12),
         )
 
-        # 2) refine -> contact point + face color estimate
+        # 2) refine contact points + face color estimate
         refined_rect_pts, contact_colors = refine_points_and_colors(
             rect_res.rect_bgr,
             target_center=rect_res.center_final,
@@ -160,7 +165,7 @@ def render_analyze_step():
         # de-dup refined points
         dedup = []
         dedup_cols = []
-        min_d2 = 18.0 ** 2
+        min_d2 = 18.0**2
         for p, col in zip(refined_rect_pts, contact_colors):
             ok = True
             for q in dedup:
@@ -171,7 +176,7 @@ def render_analyze_step():
                 dedup.append(p)
                 dedup_cols.append(col)
 
-        # 3) map to canonical using pose matrix (critical)
+        # 3) map to canonical
         auto_pts_canon = transform_points(dedup, rect_res.M_rect_to_canon)
 
         st.session_state.cv_cache_key = cache_key
@@ -180,17 +185,22 @@ def render_analyze_step():
         st.session_state.auto_contact_colors = dedup_cols
         st.session_state.points = []
         st.session_state.last_result = None
-
         st.session_state._geom_center = CANON_CENTER
         st.session_state._geom_outer = CANON_OUTER
-
         st.session_state._rect_photo_rgb = _bgr_to_rgb_uint8(rect_res.rect_bgr)
         st.session_state.warp_debug = rect_res.debug
+
+        # NEW: quality in session
+        st.session_state.cv_quality = {
+            "score": float(rect_res.quality_score),
+            "flags": list(rect_res.quality_flags),
+        }
 
     bg_rgb = st.session_state.overlay_image_rgb
     auto_pts = st.session_state.auto_points
     center = st.session_state._geom_center
     outer = st.session_state._geom_outer
+    quality = st.session_state.get("cv_quality", None)
 
     st.subheader(t("tap_points", lang))
     st.caption("Pose first (midline/X + circle refine) → then contact points. Purple = hits.")
@@ -201,6 +211,8 @@ def render_analyze_step():
         cols = st.session_state.get("auto_contact_colors", [])
         if cols:
             st.write({"contact_face_color_preview": cols[: min(10, len(cols))]})
+        if quality is not None:
+            st.write({"quality": quality})
 
     initial = None
     if not st.session_state.points:
@@ -235,11 +247,20 @@ def render_analyze_step():
             return
 
         pts_xy = [(p["x"], p["y"]) for p in points[:need]]
-
         scoring = score_hits(center, outer, pts_xy)
-        metrics = compute_metrics(points[:need])
+
+        # NEW: center/outer-aware metrics (offset + ratios)
+        metrics = compute_metrics(points[:need], center=center, outer_radius_px=outer)
         shape = classify_shape(metrics)
-        advice = next_end_advice(metrics, shape, st.session_state.handedness, lang=lang)
+
+        # NEW: quality-aware advice
+        advice = next_end_advice(
+            metrics,
+            shape,
+            st.session_state.handedness,
+            lang=lang,
+            quality=quality,
+        )
 
         face_bgr = cv2.cvtColor(bg_rgb, cv2.COLOR_RGB2BGR)
         overlay_hits = _draw_hits_on_face(face_bgr, pts_xy, scoring["scores"])
@@ -251,6 +272,7 @@ def render_analyze_step():
             "advice": advice,
             "scoring": scoring,
             "overlay_hits_rgb": overlay_hits_rgb,
+            "quality": quality,
         }
         st.rerun()
 
@@ -259,6 +281,8 @@ def render_analyze_step():
         metrics = res["metrics"]
         scoring = res["scoring"]
         advice = res["advice"]
+        quality = res.get("quality", None)
+        offset = metrics.get("offset", {}) or {}
 
         st.divider()
         st.subheader("Overlay (standard face + hits + scores)")
@@ -274,10 +298,17 @@ def render_analyze_step():
         st.write(f"- Spread (avg): **{metrics['spread']:.1f} px**")
         st.write(f"- sx / sy: **{metrics['sx']:.1f} / {metrics['sy']:.1f}**")
         st.write(f"- Direction: **{metrics['slope_deg']:.0f}°**")
+        st.write(f"- Offset dx/dy: **{offset.get('dx', 0.0):.1f} / {offset.get('dy', 0.0):.1f} px**")
+        if metrics.get("offset_ratio", None) is not None:
+            st.write(f"- Offset ratio: **{metrics['offset_ratio']:.3f}**")
+        if metrics.get("spread_ratio", None) is not None:
+            st.write(f"- Spread ratio: **{metrics['spread_ratio']:.3f}**")
+        if quality is not None:
+            st.write(f"- CV quality: **{float(quality.get('score', 1.0)):.2f}** ({quality.get('flags', [])})")
 
         st.subheader("Next end cue")
         st.markdown(f"**{advice['title']}**")
-        st.markdown(f"👉 {advice['cue']}")
+        st.markdown(f"{advice['cue']}")
         with st.expander("Why"):
             st.write(advice["why"])
 
