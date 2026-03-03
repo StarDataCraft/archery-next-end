@@ -21,8 +21,7 @@ CANON_OUTER = CANON_SIZE * 0.45  # 405 px
 
 
 def _bgr_to_rgb_uint8(bgr: np.ndarray) -> np.ndarray:
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    return rgb.astype(np.uint8)
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.uint8)
 
 
 def _points_to_initial_drawing(points, r=10):
@@ -83,11 +82,9 @@ def _canon_to_rect_points(points_xy, M_rect_to_canon):
     """
     if not points_xy:
         return []
-
     if M_rect_to_canon is None:
         raise TypeError("M_rect_to_canon is None (cannot invert affine transform).")
 
-    # Accept list -> np.array
     if not isinstance(M_rect_to_canon, np.ndarray):
         try:
             M_rect_to_canon = np.array(M_rect_to_canon, dtype=np.float32)
@@ -186,7 +183,6 @@ def render_analyze_step():
             roi_radius=70,
         )
 
-        # map to canonical
         auto_pts_canon = transform_points(refined_rect_pts, rect_res.M_rect_to_canon)
 
         st.session_state.cv_cache_key = cache_key
@@ -195,13 +191,11 @@ def render_analyze_step():
         st.session_state.points = []
         st.session_state.last_result = None
 
-        # keep geometry + rectified photo + transform for later (color sampling on analyze)
         st.session_state._geom_center = CANON_CENTER
         st.session_state._geom_outer = CANON_OUTER
         st.session_state._rect_photo_bgr = rect_res.rect_bgr.copy()
         st.session_state._M_rect_to_canon = rect_res.M_rect_to_canon.copy()
         st.session_state.warp_debug = rect_res.debug
-
         st.session_state.cv_quality = {
             "score": float(rect_res.quality_score),
             "flags": list(rect_res.quality_flags),
@@ -257,34 +251,15 @@ def render_analyze_step():
             rect_bgr = st.session_state._rect_photo_bgr
             M_rect_to_canon = st.session_state._M_rect_to_canon
 
-            # ---- DEBUG: print types + small examples ----
-            with st.expander("DEBUG (types + samples)", expanded=True):
-                st.write("type(pts_xy):", type(pts_xy))
-                st.write("pts_xy[:1]:", pts_xy[:1])
-                st.write("type(rect_bgr):", type(rect_bgr), "shape:", getattr(rect_bgr, "shape", None))
-                st.write("type(M_rect_to_canon):", type(M_rect_to_canon))
-                st.write("M_rect_to_canon shape:", getattr(M_rect_to_canon, "shape", None))
-
             rect_pts = _canon_to_rect_points(pts_xy, M_rect_to_canon)
 
-            with st.expander("DEBUG (rect pts + hsv)", expanded=False):
-                st.write("rect_pts[:2]:", rect_pts[:2])
-
-            # sample_contact_color_hsv signature may differ across your local versions.
-            # Support both:
-            #   sample_contact_color_hsv(rect_bgr, (x,y), roi_radius=18)
-            #   sample_contact_color_hsv(rect_bgr, x, y, r=10)
             hsvs = []
             for rp in rect_pts:
                 try:
-                    hsv = sample_contact_color_hsv(rect_bgr, rp, roi_radius=18)  # (bgr, (x,y), roi_radius=?)
+                    hsv = sample_contact_color_hsv(rect_bgr, rp, roi_radius=18)
                 except TypeError:
-                    hsv = sample_contact_color_hsv(rect_bgr, rp[0], rp[1], r=10)  # (bgr, x, y, r=?)
+                    hsv = sample_contact_color_hsv(rect_bgr, rp[0], rp[1], r=10)
                 hsvs.append(hsv)
-
-            with st.expander("DEBUG (hsv samples)", expanded=False):
-                st.write("hsvs[:2]:", hsvs[:2])
-                st.write("hsv element types:", [type(x).__name__ for x in hsvs[:5]])
 
             scoring = score_hits_color_aware(center, outer, pts_xy, contact_hsvs=hsvs)
 
@@ -315,9 +290,9 @@ def render_analyze_step():
             st.rerun()
 
         except Exception as e:
-            st.error("Analyze crashed. Full traceback below:")
-            st.exception(e)  # shows full traceback in the UI
-            st.stop()
+            st.error("Analyze crashed.")
+            st.exception(e)
+            return
 
     if st.session_state.last_result:
         res = st.session_state.last_result
@@ -347,11 +322,34 @@ def render_analyze_step():
         if quality is not None:
             st.write(f"- CV quality: **{float(quality.get('score', 1.0)):.2f}** ({quality.get('flags', [])})")
 
-        st.subheader("Next end cue")
-        st.markdown(f"**{advice['title']}**")
-        st.markdown(f"{advice['cue']}")
-        with st.expander("Why"):
-            st.write(advice["why"])
+        # -----------------------------
+        # NEW: repetition-first coaching block
+        # -----------------------------
+        st.subheader("Next end coaching (repetition-first)")
+        st.markdown(f"**{advice.get('title','')}**")
+
+        # 1) One cue
+        st.markdown(f"**One cue**: {advice.get('single_cue', advice.get('cue',''))}")
+
+        # 2) PASS/FAIL
+        st.markdown(f"**PASS/FAIL**: {advice.get('pass_fail','')}")
+
+        # 3) Fallback
+        st.markdown(f"**If it breaks**: {advice.get('fallback','')}")
+
+        # 4) Immediate drill
+        drill = advice.get("drill", {}) or {}
+        if drill:
+            st.markdown(f"**Immediate drill ({drill.get('duration_s','?')}s)**: {drill.get('name','')}")
+            st.markdown(drill.get("how", ""))
+
+        # 5) Mental phrase
+        st.markdown(f"**Mental phrase**: {advice.get('mental_phrase','')}")
+
+        # 6) Script (compact)
+        with st.expander("Shot Script (compact)"):
+            st.code(advice.get("script", ""), language="text")
+            st.write({"stage": advice.get("stage"), "tag": advice.get("tag"), "principle": advice.get("principle")})
 
     if save_clicked:
         if not st.session_state.last_result:
