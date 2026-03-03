@@ -25,6 +25,13 @@ def _subpix_refine(gray_roi: np.ndarray, pt: Tuple[float, float]) -> Tuple[float
 
 
 def _sample_face_color_under_arrow(bgr: np.ndarray, x: float, y: float, r: int = 10) -> Dict[str, Any]:
+    """
+    Sample color near (x,y) but try to ignore arrow pixels (often dark).
+    Strategy:
+      - take a small disk ROI
+      - convert to HSV
+      - mask out low-V pixels (dark arrow/carbon) => use remaining pixels median as "face color"
+    """
     h, w = bgr.shape[:2]
     cx, cy = int(round(x)), int(round(y))
     x1 = max(0, cx - r)
@@ -37,9 +44,11 @@ def _sample_face_color_under_arrow(bgr: np.ndarray, x: float, y: float, r: int =
 
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     V = hsv[:, :, 2]
-    keep = V > 60  # filter dark pixels (arrow)
 
-    if int(np.sum(keep)) < 10:
+    # mask out dark pixels (likely arrow)
+    keep = V > 60
+    if np.sum(keep) < 10:
+        # too occluded; fallback to raw median
         hsv_med = [int(np.median(hsv[:, :, 0])), int(np.median(hsv[:, :, 1])), int(np.median(hsv[:, :, 2]))]
         return {"ok": True, "hsv_median": hsv_med, "note": "fallback_raw"}
 
@@ -47,10 +56,14 @@ def _sample_face_color_under_arrow(bgr: np.ndarray, x: float, y: float, r: int =
     h_med = int(np.median(hsv_kept[:, 0]))
     s_med = int(np.median(hsv_kept[:, 1]))
     v_med = int(np.median(hsv_kept[:, 2]))
+
     return {"ok": True, "hsv_median": [h_med, s_med, v_med], "note": "masked_dark"}
 
 
 def _best_arrow_segment_in_roi(roi_g: np.ndarray, min_len: int) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Prefer LSD (more stable than Hough) if available.
+    """
     try:
         lsd = cv2.createLineSegmentDetector(0)
         lines = lsd.detect(roi_g)[0]
@@ -69,10 +82,16 @@ def _best_arrow_segment_in_roi(roi_g: np.ndarray, min_len: int) -> Optional[Tupl
         pass
 
     edges = cv2.Canny(roi_g, 60, 150)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=35, minLineLength=min_len, maxLineGap=10)
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=35,
+        minLineLength=min_len,
+        maxLineGap=10,
+    )
     if lines is None:
         return None
-
     best = None
     best_len = 0.0
     for (x1, y1, x2, y2) in lines[:, 0, :]:
@@ -84,11 +103,18 @@ def _best_arrow_segment_in_roi(roi_g: np.ndarray, min_len: int) -> Optional[Tupl
 
 
 def _find_contact_point(gray_roi: np.ndarray, line: Tuple[int, int, int, int], center_roi: Tuple[float, float]) -> Tuple[float, float]:
+    """
+    Contact point ≈ first strong edge peak near tip-side (endpoint closer to center).
+    Improve over previous:
+      - use gradient magnitude
+      - pick *earliest* strong peak within first N px from tip into shaft direction
+    """
     x1, y1, x2, y2 = line
     cx, cy = center_roi
 
     d1 = (x1 - cx) ** 2 + (y1 - cy) ** 2
     d2 = (x2 - cx) ** 2 + (y2 - cy) ** 2
+
     if d1 <= d2:
         tip = np.array([x1, y1], dtype=np.float32)
         tail = np.array([x2, y2], dtype=np.float32)
@@ -107,13 +133,16 @@ def _find_contact_point(gray_roi: np.ndarray, line: Tuple[int, int, int, int], c
     mag = np.sqrt(gX * gX + gY * gY)
 
     scan_n = int(min(55, max(18, L * 0.35)))
-    vals, xs, ys = [], [], []
+    vals = []
+    xs = []
+    ys = []
     for i in range(scan_n):
         p = tip + v * i
         px, py = int(round(p[0])), int(round(p[1]))
         if px < 1 or py < 1 or px >= gray_roi.shape[1] - 1 or py >= gray_roi.shape[0] - 1:
             continue
-        xs.append(float(p[0])); ys.append(float(p[1]))
+        xs.append(float(p[0]))
+        ys.append(float(p[1]))
         vals.append(float(mag[py, px]))
 
     if not vals:
@@ -159,6 +188,7 @@ def refine_points_and_colors(
         if arrow_present:
             min_len = max(22, int(min(roi_g.shape) * 0.40))
             seg = _best_arrow_segment_in_roi(roi_g, min_len=min_len)
+
             if seg is not None:
                 rx, ry = _find_contact_point(roi_g, seg, center_roi)
                 rx2, ry2 = _subpix_refine(roi_g, (rx, ry))
@@ -167,13 +197,14 @@ def refine_points_and_colors(
                 colors.append(_sample_face_color_under_arrow(rect_bgr, fx, fy, r=10))
                 continue
 
+            # fallback: subpix around coarse
             rx, ry = _subpix_refine(roi_g, (lx, ly))
             fx, fy = rx + x1, ry + y1
             refined.append((fx, fy))
             colors.append(_sample_face_color_under_arrow(rect_bgr, fx, fy, r=10))
             continue
 
-        # no arrow: blob-ish refine
+        # no arrow: blob/hole path (keep simple but stable)
         g = cv2.GaussianBlur(roi_g, (0, 0), 1.2)
         lap = cv2.Laplacian(g, cv2.CV_32F, ksize=3)
         lap = np.abs(lap)
@@ -181,7 +212,7 @@ def refine_points_and_colors(
         _, th = cv2.threshold(lap_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         th = cv2.medianBlur(th, 5)
 
-        num_labels, _, stats, cents = cv2.connectedComponentsWithStats(th, connectivity=8)
+        num_labels, labels, stats, cents = cv2.connectedComponentsWithStats(th, connectivity=8)
         best = None
         best_d = 1e18
         for i in range(1, num_labels):
