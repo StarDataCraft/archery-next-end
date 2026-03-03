@@ -10,10 +10,10 @@ from .state import goto_step, reset_shot, reset_cv_cache
 from .metrics import compute_metrics, classify_shape
 from .rules import next_end_advice
 from .storage import make_log_entry, export_log_json
-from .cv_target import rectify_target, propose_hit_points
+from .cv_target import rectify_target, transform_points
+from .refine_points import refine_points_and_colors
 from .scoring import score_hits
 from .target_face import render_target_face_bgr
-from .refine_points import refine_points
 
 
 CANON_SIZE = 900
@@ -34,8 +34,8 @@ def _points_to_initial_drawing(points, r=10):
             "left": float(x - r),
             "top": float(y - r),
             "radius": float(r),
-            "fill": "rgba(255, 0, 0, 0.25)",
-            "stroke": "rgba(255, 0, 0, 0.9)",
+            "fill": "rgba(180, 0, 255, 0.22)",   # purple-ish fill
+            "stroke": "rgba(180, 0, 255, 0.95)", # purple stroke
             "strokeWidth": 2,
         })
     return {"version": "4.4.0", "objects": objects}
@@ -54,31 +54,14 @@ def _extract_points_from_canvas(json_data: dict):
     return pts
 
 
-def _map_points_to_canon(points_xy, src_center, src_outer):
-    """
-    Map points from rectified-photo coords -> canonical face coords.
-    x' = Cc + (x - Cs) * (Rc / Rs)
-    """
-    if src_outer <= 1e-6:
-        return points_xy
-    sx, sy = src_center
-    cx, cy = CANON_CENTER
-    scale = CANON_OUTER / float(src_outer)
-    out = []
-    for (x, y) in points_xy:
-        out.append((cx + (x - sx) * scale, cy + (y - sy) * scale))
-    return out
-
-
 def _draw_hits_on_face(face_bgr, points_xy, scores):
-    """Draw hit points + scores on the clean face (no color tint)."""
     img = face_bgr.copy()
     PURPLE = (255, 0, 255)  # BGR
 
     for i, (x, y) in enumerate(points_xy):
         px, py = int(round(x)), int(round(y))
-        cv2.circle(img, (px, py), 10, PURPLE, 2)   # purple ring
-        cv2.circle(img, (px, py), 2, PURPLE, -1)   # purple dot
+        cv2.circle(img, (px, py), 10, PURPLE, 2)
+        cv2.circle(img, (px, py), 2, PURPLE, -1)
 
         if i < len(scores):
             s = scores[i]
@@ -138,7 +121,7 @@ def render_analyze_step():
     file = st.file_uploader("", type=["png", "jpg", "jpeg"])
 
     if not file:
-        st.info("Upload → rectify → auto candidates → confirm points → analyze (score + cue)")
+        st.info("Upload → rectify → (target pose) → arrow contact points → confirm → analyze")
         return
 
     img_pil = Image.open(file).convert("RGB")
@@ -148,9 +131,10 @@ def render_analyze_step():
     need = int(st.session_state.arrows_per_end)
 
     if st.session_state.get("cv_cache_key") != cache_key:
+        # 1) rectify target + detect midline + detect X + build mapping matrix
         rect_res = rectify_target(img_rgb, out_size=CANON_SIZE)
 
-        # Clean standard face background uses CANON geometry (NOT CV geometry)
+        # 2) render clean canonical face
         face_bgr = render_target_face_bgr(
             st.session_state.target_face,
             size=CANON_SIZE,
@@ -160,37 +144,48 @@ def render_analyze_step():
             ring_line_thickness=2,
         )
 
-        # Propose points from rectified photo
-        auto_pts_src = propose_hit_points(
-            rect_res.rect_bgr,
-            rect_res.center,
-            rect_res.arrow_present,
-            max_points=12
-        )
+        # 3) propose coarse points (still via your existing coarse method)
+        #    We intentionally do: target pose first (rectify_target already done),
+        #    then arrow contact detection/refine here.
+        #    coarse points should exist; we can seed with a simple heuristic:
+        #    use multiple line endpoints by calling refine_points directly on a simple seed:
+        #    (we use a few center-biased seeds to force detection in presence of arrows)
+        # For robustness, we use a small seed set around center; refine_points will snap to arrow lines.
+        seeds = []
+        cfx, cfy = rect_res.center_final
+        for dx, dy in [(0, 0), (30, 0), (-30, 0), (0, 30), (0, -30), (45, 25), (-45, 25)]:
+            seeds.append((cfx + dx, cfy + dy))
 
-        # NEW: automatic refinement (no user help)
-        auto_pts_refined = refine_points(
+        refined_rect_pts, contact_colors = refine_points_and_colors(
             rect_res.rect_bgr,
-            rect_res.center,
-            auto_pts_src,
+            target_center=rect_res.center_final,
+            coarse_points=seeds,
             arrow_present=rect_res.arrow_present,
-            roi_radius=45,
+            roi_radius=75,
         )
 
-        # map refined points into canonical
-        auto_pts = _map_points_to_canon(auto_pts_refined, rect_res.center, rect_res.outer_radius)
+        # de-duplicate refined points (in rect coords)
+        dedup = []
+        dedup_colors = []
+        min_d2 = 18.0 ** 2
+        for p, col in zip(refined_rect_pts, contact_colors):
+            ok = True
+            for q in dedup:
+                if (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 < min_d2:
+                    ok = False
+                    break
+            if ok:
+                dedup.append(p)
+                dedup_colors.append(col)
+
+        # 4) map rect points -> canonical
+        auto_pts_canon = transform_points(dedup, rect_res.M_rect_to_canon)
 
         st.session_state.cv_cache_key = cache_key
-        st.session_state.warp_debug = {
-            **rect_res.debug,
-            "canon_center": CANON_CENTER,
-            "canon_outer": CANON_OUTER,
-            "auto_pts_src": auto_pts_src,
-            "auto_pts_refined": auto_pts_refined,
-        }
-
         st.session_state.overlay_image_rgb = _bgr_to_rgb_uint8(face_bgr)
-        st.session_state.auto_points = auto_pts
+
+        st.session_state.auto_points = auto_pts_canon
+        st.session_state.auto_contact_colors = dedup_colors
         st.session_state.points = []
         st.session_state.last_result = None
 
@@ -198,32 +193,33 @@ def render_analyze_step():
         st.session_state._geom_center = CANON_CENTER
         st.session_state._geom_outer = CANON_OUTER
 
-        # keep rectified photo only for debug
+        # debug
         st.session_state._rect_photo_rgb = _bgr_to_rgb_uint8(rect_res.rect_bgr)
-        st.session_state._geom_arrow_present = rect_res.arrow_present
+        st.session_state.warp_debug = rect_res.debug
 
     bg_rgb = st.session_state.overlay_image_rgb
     auto_pts = st.session_state.auto_points
     center = st.session_state._geom_center
     outer = st.session_state._geom_outer
-    arrow_present = st.session_state._geom_arrow_present
 
     st.subheader(t("tap_points", lang))
-    st.caption("Background is a clean standard target face (correct colors). Ring lines are black. Confirm / add / delete hit points.")
+    st.caption("We detect target pose first (midline/X), then find arrow-to-face contact points automatically. Confirm / add / delete.")
 
-    with st.expander("CV debug"):
+    with st.expander("CV debug (pose + contact color)"):
         st.write(st.session_state.warp_debug)
-        st.write({"arrow_present": arrow_present, "need_points": need})
-        st.image(st.session_state._rect_photo_rgb, caption="Rectified photo (debug only)", use_column_width=False)
+        st.image(st.session_state._rect_photo_rgb, caption="Rectified photo (debug)", use_column_width=False)
+        cols = st.session_state.get("auto_contact_colors", [])
+        if cols:
+            st.write({"contact_colors_preview": cols[: min(10, len(cols))]})
 
     initial = None
     if not st.session_state.points:
         initial = _points_to_initial_drawing(auto_pts[:need], r=10)
 
     canvas = st_canvas(
-        fill_color="rgba(255, 0, 0, 0.25)",
+        fill_color="rgba(180, 0, 255, 0.22)",
         stroke_width=3,
-        stroke_color="rgba(255, 0, 0, 0.9)",
+        stroke_color="rgba(180, 0, 255, 0.95)",
         background_image=Image.fromarray(bg_rgb),
         update_streamlit=True,
         height=700,
@@ -250,13 +246,10 @@ def render_analyze_step():
 
         pts_xy = [(p["x"], p["y"]) for p in points[:need]]
 
-        # scoring uses canonical center/outer -> stable
         scoring = score_hits(center, outer, pts_xy)
-
         metrics = compute_metrics(points[:need])
         shape = classify_shape(metrics)
 
-        # Advice language follows UI language
         advice = next_end_advice(metrics, shape, st.session_state.handedness, lang=lang)
 
         face_bgr = cv2.cvtColor(bg_rgb, cv2.COLOR_RGB2BGR)
