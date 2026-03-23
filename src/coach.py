@@ -4,18 +4,14 @@ from __future__ import annotations
 import os
 import re
 import json
-import math
 import time
+import math
 import hashlib
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
 
-# Optional deps:
-# - pypdf (or PyPDF2) for PDF text extraction
-# - sentence_transformers for embeddings
-# - llama_cpp for local LLM generation (GGUF)
 try:
     from pypdf import PdfReader  # type: ignore
 except Exception:
@@ -41,15 +37,17 @@ class CoachConfig:
     chunk_overlap: int = 140
     top_k: int = 6
 
-    # generation mode:
     # "rules" | "rag" | "rag_llm"
     mode: str = "rag"
 
-    # optional local LLM:
+    # local LLM (optional)
     gguf_path: str = "models/llm.gguf"
     llm_ctx: int = 2048
     llm_max_tokens: int = 420
     llm_temperature: float = 0.3
+
+    # routing
+    router: str = "fine"  # "coarse" | "fine"
 
 
 def _ensure_dir(p: str) -> None:
@@ -72,7 +70,6 @@ def _read_pdf_text(pdf_path: str) -> str:
         raise RuntimeError("pypdf not installed. Please `pip install pypdf`.")
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
-
     reader = PdfReader(pdf_path)
     pages = []
     for i, page in enumerate(reader.pages):
@@ -107,282 +104,339 @@ def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
 class _Embedder:
     def __init__(self, model_name: str):
         if SentenceTransformer is None:
-            raise RuntimeError("sentence-transformers not installed. `pip install sentence-transformers`.")
+            raise RuntimeError("sentence-transformers not installed. Please `pip install sentence-transformers`.")
         self.model = SentenceTransformer(model_name)
 
-    def encode(self, texts: List[str]) -> np.ndarray:
-        emb = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+    def embed(self, texts: List[str]) -> np.ndarray:
+        emb = self.model.encode(texts, normalize_embeddings=True)
         return np.asarray(emb, dtype=np.float32)
 
 
-class _LocalLLM:
-    def __init__(self, gguf_path: str, ctx: int):
-        if Llama is None:
-            raise RuntimeError("llama-cpp-python not installed. `pip install llama-cpp-python`.")
-        if not os.path.exists(gguf_path):
-            raise FileNotFoundError(f"GGUF model not found: {gguf_path}")
-        self.llm = Llama(model_path=gguf_path, n_ctx=ctx, verbose=False)
-
-    def generate(self, prompt: str, max_tokens: int, temperature: float) -> str:
-        out = self.llm(
-            prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            stop=["</END>"],
-        )
-        return (out["choices"][0]["text"] or "").strip()
-
-
-class CoachRAG:
-    """
-    RAG coach:
-      - load PDF (cached)
-      - chunk
-      - embed + store
-      - retrieve top-k relevant chunks per query
-      - synthesize “repetition-first” coaching text
-    """
-
+class _Index:
     def __init__(self, cfg: CoachConfig):
         self.cfg = cfg
         _ensure_dir(cfg.cache_dir)
-        self._embedder: Optional[_Embedder] = None
-        self._llm: Optional[_LocalLLM] = None
+        self.idx_path = os.path.join(cfg.cache_dir, f"idx-{_sha1(cfg.pdf_path)}-{_sha1(cfg.embed_model)}.json")
+        self.vec_path = os.path.join(cfg.cache_dir, f"vec-{_sha1(cfg.pdf_path)}-{_sha1(cfg.embed_model)}.npy")
 
-        self._chunks: List[str] = []
-        self._emb: Optional[np.ndarray] = None
-        self._index_loaded = False
+        self.chunks: List[str] = []
+        self.vecs: Optional[np.ndarray] = None
 
-    def _lazy_embedder(self) -> _Embedder:
-        if self._embedder is None:
-            self._embedder = _Embedder(self.cfg.embed_model)
-        return self._embedder
-
-    def _lazy_llm(self) -> _LocalLLM:
-        if self._llm is None:
-            self._llm = _LocalLLM(self.cfg.gguf_path, self.cfg.llm_ctx)
-        return self._llm
-
-    def _cache_paths(self) -> Tuple[str, str, str]:
-        pdf_hash = _sha1(os.path.abspath(self.cfg.pdf_path) + str(os.path.getmtime(self.cfg.pdf_path)))
-        base = os.path.join(self.cfg.cache_dir, f"idx_{pdf_hash}")
-        return base + ".json", base + ".npy", base + ".meta.json"
-
-    def build_or_load(self) -> None:
-        if self._index_loaded:
+    def load_or_build(self) -> None:
+        if os.path.exists(self.idx_path) and os.path.exists(self.vec_path):
+            with open(self.idx_path, "r", encoding="utf-8") as f:
+                self.chunks = json.load(f)["chunks"]
+            self.vecs = np.load(self.vec_path)
             return
 
-        idx_json, emb_npy, meta_json = self._cache_paths()
-
-        if os.path.exists(idx_json) and os.path.exists(emb_npy) and os.path.exists(meta_json):
-            with open(idx_json, "r", encoding="utf-8") as f:
-                self._chunks = json.load(f)
-            self._emb = np.load(emb_npy).astype(np.float32)
-            self._index_loaded = True
-            return
-
-        # Build
         text = _read_pdf_text(self.cfg.pdf_path)
         chunks = _chunk_text(text, self.cfg.chunk_chars, self.cfg.chunk_overlap)
 
-        emb = self._lazy_embedder().encode(chunks)
+        emb = _Embedder(self.cfg.embed_model)
+        vecs = emb.embed(chunks)
 
-        with open(idx_json, "w", encoding="utf-8") as f:
-            json.dump(chunks, f, ensure_ascii=False)
+        with open(self.idx_path, "w", encoding="utf-8") as f:
+            json.dump({"chunks": chunks}, f, ensure_ascii=False)
 
-        np.save(emb_npy, emb)
+        np.save(self.vec_path, vecs)
 
-        with open(meta_json, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "pdf_path": self.cfg.pdf_path,
-                    "embed_model": self.cfg.embed_model,
-                    "chunk_chars": self.cfg.chunk_chars,
-                    "chunk_overlap": self.cfg.chunk_overlap,
-                    "created_at": time.time(),
-                },
-                f,
-                ensure_ascii=False,
-                indent=2,
-            )
+        self.chunks = chunks
+        self.vecs = vecs
 
-        self._chunks = chunks
-        self._emb = emb
-        self._index_loaded = True
-
-    def retrieve(self, query: str, top_k: Optional[int] = None) -> List[Dict[str, Any]]:
-        self.build_or_load()
-        assert self._emb is not None
-
-        top_k = top_k or self.cfg.top_k
-        q_emb = self._lazy_embedder().encode([query])[0]
-
-        sims = []
-        for i in range(len(self._chunks)):
-            sims.append((i, float(np.dot(self._emb[i], q_emb))))  # normalized
-        sims.sort(key=lambda x: x[1], reverse=True)
-
+    def search(self, query: str, top_k: int) -> List[Dict[str, Any]]:
+        if self.vecs is None:
+            raise RuntimeError("Index not loaded.")
+        emb = _Embedder(self.cfg.embed_model)
+        qv = emb.embed([query])[0]
+        sims = [(_cosine_sim(qv, self.vecs[i]), i) for i in range(len(self.chunks))]
+        sims.sort(reverse=True)
         out = []
-        for idx, sim in sims[:top_k]:
-            out.append({"rank": len(out) + 1, "sim": sim, "chunk": self._chunks[idx]})
+        for s, i in sims[:top_k]:
+            out.append({"score": float(s), "text": self.chunks[i]})
         return out
 
-    # -----------------------------
-    # Synthesis
-    # -----------------------------
-    def _make_query(self, metrics: Dict[str, Any], shape: str, handedness: str, lang: str) -> str:
-        # Keep it simple but informative for retrieval
-        spread = metrics.get("spread", None)
-        slope = metrics.get("slope_deg", None)
-        offset = metrics.get("offset", {}) or {}
-        dx = offset.get("dx", 0.0)
-        dy = offset.get("dy", 0.0)
-        return (
-            f"archery repetition coaching. shape={shape}, handedness={handedness}, "
-            f"spread={spread:.1f} px, slope={slope:.0f} deg, offset(dx={dx:.1f}, dy={dy:.1f}). "
-            f"Need one-cue shot script, pass/fail, fallback, micro-drill. language={lang}."
-        )
 
-    def _fallback_compose(self, base_advice: Dict[str, Any], retrieved: List[Dict[str, Any]], lang: str) -> Dict[str, Any]:
-        """
-        No LLM. Still produce flexible output:
-        - keep base advice’s single cue
-        - attach retrieved “principles” as supporting bullets
-        """
-        cue = base_advice.get("single_cue") or base_advice.get("cue") or ""
-        title = base_advice.get("title") or "Coaching"
-
-        # Extract 2–3 short “principle lines” from retrieved chunks (very conservative)
-        def pick_lines(txt: str) -> List[str]:
-            lines = [l.strip() for l in re.split(r"[\n\.]", txt) if l.strip()]
-            # prefer lines mentioning repetition / form / consistency / let down
-            key = ["repeat", "repetition", "consistent", "let down", "routine", "shot", "form", "process",
-                   "反復", "繰り返", "一致", "下ろ", "ルーティン", "フォーム", "過程", "重复", "一致", "放下", "流程"]
-            scored = []
-            for l in lines:
-                s = sum(1 for k in key if k.lower() in l.lower())
-                if 10 <= len(l) <= 140:
-                    scored.append((s, l))
-            scored.sort(key=lambda x: x[0], reverse=True)
-            return [l for _, l in scored[:3]]
-
-        support = []
-        for r in retrieved[:3]:
-            support.extend(pick_lines(r["chunk"]))
-        support = support[:5]
-
-        # Minimal repeated-structure output
-        if lang == "zh":
-            pass_fail = "通过：这一靶能在同一节奏下稳定复现口令；失败：开始补偿/加力/拖时。"
-            fallback = "崩了就放下重来；只保留“口令 + 节奏”，先别追分。"
-            mental = "“同一件事，用同一种方式。”"
-            script = f"【本靶唯一口令】{cue}\n【通过/失败】{pass_fail}\n【崩了就回滚】{fallback}"
-            if support:
-                script += "\n【来自书的提醒】" + "\n- " + "\n- ".join(support)
-        elif lang == "ja":
-            pass_fail = "PASS：同じテンポで合図を再現できる。FAIL：補正/力み/時間超過が出る。"
-            fallback = "崩れたら必ず下ろす。合図＋テンポだけ守る（得点は捨てる）。"
-            mental = "「同じことを、同じように」"
-            script = f"【このエンドの一言】{cue}\n【合格/失敗】{pass_fail}\n【崩れたら】{fallback}"
-            if support:
-                script += "\n【本からのヒント】" + "\n- " + "\n- ".join(support)
-        else:
-            pass_fail = "PASS: you can repeat the cue with the same tempo. FAIL: you start compensating / tensing / overrunning time."
-            fallback = "If it breaks, always let down. Protect cue + tempo; ignore score."
-            mental = '"Same thing. Same way."'
-            script = f"[One cue] {cue}\n[PASS/FAIL] {pass_fail}\n[If it breaks] {fallback}"
-            if support:
-                script += "\n[Book reminders]\n- " + "\n- ".join(support)
-
-        out = dict(base_advice)
-        out.update(
-            {
-                "title": title,
-                "single_cue": cue,
-                "pass_fail": pass_fail,
-                "fallback": fallback,
-                "mental_phrase": mental,
-                "script": script,
-                "rag": {"top_k": len(retrieved), "snippets": retrieved},
-            }
-        )
-        return out
-
-    def _llm_compose(self, base_advice: Dict[str, Any], retrieved: List[Dict[str, Any]], metrics: Dict[str, Any], shape: str, handedness: str, lang: str) -> Dict[str, Any]:
-        """
-        With local LLM:
-        - feed retrieved chunks as context
-        - ask for structured JSON to avoid verbose hallucination
-        """
-        cue = base_advice.get("single_cue") or base_advice.get("cue") or ""
-        title = base_advice.get("title") or "Coaching"
-
-        context = "\n\n".join([f"(ctx {i+1}, sim={r['sim']:.3f})\n{r['chunk']}" for i, r in enumerate(retrieved[: self.cfg.top_k])])
-        prompt = f"""
-You are an archery coach. Use ONLY the provided context excerpts as inspiration. Do not quote long passages.
-Task: produce a repetition-first coaching script for the next end.
-
-User stats:
-- shape: {shape}
-- handedness: {handedness}
-- metrics: {json.dumps(metrics, ensure_ascii=False)}
-
-Base cue (must keep consistent unless clearly wrong):
-- cue: {cue}
-
-Output MUST be valid JSON with keys:
-title, single_cue, pass_fail, fallback, drill (name, how, duration_s), mental_phrase, script.
-Language: {lang}  (zh=Chinese, ja=Japanese, en=English)
-Keep single_cue short. pass_fail observable. fallback actionable. drill 30-120s.
-End with </END>.
-
-Context:
-{context}
-</END>
+def _short_profile(profile: Dict[str, Any]) -> str:
+    return _clean_text(
+        f"""
+name: {profile.get('name','')}
+bow: {profile.get('bow','')}
+experience_months: {profile.get('experience_months','')}
+dominant_eye: {profile.get('dominant_eye','')}
+goals: {profile.get('goals','')}
+recurring_issues: {profile.get('recurring_issues','')}
+constraints: {profile.get('constraints','')}
+style: {profile.get('language_style','tight')}
 """.strip()
+    )
 
-        llm = self._lazy_llm()
-        txt = llm.generate(prompt, max_tokens=self.cfg.llm_max_tokens, temperature=self.cfg.llm_temperature)
 
-        # best-effort JSON parse
-        try:
-            start = txt.find("{")
-            end = txt.rfind("}")
-            obj = json.loads(txt[start : end + 1])
-        except Exception:
-            # fall back to non-LLM synthesis
-            return self._fallback_compose(base_advice, retrieved, lang)
+def _recent_log_summary(log: List[Dict[str, Any]], k: int = 3) -> str:
+    if not log:
+        return ""
+    tail = log[-k:]
+    lines = []
+    for e in tail:
+        dist = e.get("distance_m", "")
+        face = e.get("target_face", "")
+        scoring = e.get("scoring", {}) or {}
+        metrics = e.get("metrics", {}) or {}
+        lines.append(
+            f"- dist={dist}m face={face} total={scoring.get('total','')} avg={scoring.get('avg','')} "
+            f"spread={metrics.get('spread','')} slope={metrics.get('slope_deg','')} dx={metrics.get('offset',{}).get('dx','')} dy={metrics.get('offset',{}).get('dy','')}"
+        )
+    return "\n".join(lines)
 
-        # merge
-        out = dict(base_advice)
-        out.update(obj)
-        out["rag"] = {"top_k": len(retrieved), "snippets": retrieved}
-        return out
+
+def _route_topics(cfg: CoachConfig, metrics: Dict[str, Any], shape: str, scoring: Dict[str, Any]) -> List[str]:
+    """
+    Fine router: choose sharper topics so RAG retrieves the right pages.
+    """
+    topics = ["shot process", "repetition", "consistency"]
+
+    spread = float(metrics.get("spread", 0.0) or 0.0)
+    slope = float(metrics.get("slope_deg", 0.0) or 0.0)
+    offset = metrics.get("offset", {}) or {}
+    dx = float(offset.get("dx", 0.0) or 0.0)
+    dy = float(offset.get("dy", 0.0) or 0.0)
+
+    avg = float(scoring.get("avg", 0.0) or 0.0)
+
+    if cfg.router == "coarse":
+        if spread > 55:
+            topics += ["form breakdown", "shot rhythm", "reset drill"]
+        else:
+            topics += ["fine aiming", "hold stability"]
+        return topics
+
+    # fine routing
+    if spread > 70:
+        topics += ["tension management", "let down", "tempo reset", "subtraction"]
+    elif spread > 45:
+        topics += ["anchor consistency", "string picture", "expand through clicker"]
+    else:
+        topics += ["micro-aim", "follow-through", "quiet bow hand"]
+
+    # offset routing
+    if abs(dx) > abs(dy) and abs(dx) > 12:
+        topics += ["windage", "torque", "bow hand pressure", "grip"]
+    if abs(dy) >= abs(dx) and abs(dy) > 12:
+        topics += ["shoulder line", "front shoulder", "draw length", "anchor height"]
+
+    # slope routing
+    if 20 <= abs(slope) <= 70:
+        topics += ["release", "expansion", "back tension", "string alignment"]
+
+    # score routing
+    if avg >= 9.0:
+        topics += ["do less", "repeat the same", "protect the process"]
+    elif avg >= 7.0:
+        topics += ["one cue", "single variable", "confidence"]
+    else:
+        topics += ["rebuild", "simple drill", "no-score ends"]
+
+    # shape routing
+    if shape:
+        topics.append(f"group shape {shape}")
+
+    # de-dup
+    out = []
+    seen = set()
+    for t in topics:
+        k = t.strip().lower()
+        if k and k not in seen:
+            out.append(t)
+            seen.add(k)
+    return out
+
+
+class CoachRAG:
+    def __init__(self, cfg: CoachConfig):
+        self.cfg = cfg
+        self._index: Optional[_Index] = None
+        self._llm: Optional[Any] = None
+
+    def _ensure_index(self) -> None:
+        if self.cfg.mode == "rules":
+            return
+        if self._index is None:
+            self._index = _Index(self.cfg)
+            self._index.load_or_build()
+
+    def _ensure_llm(self) -> None:
+        if self.cfg.mode != "rag_llm":
+            return
+        if Llama is None:
+            raise RuntimeError("llama-cpp-python not installed. Please `pip install llama-cpp-python`.")
+        if not os.path.exists(self.cfg.gguf_path):
+            raise FileNotFoundError(f"GGUF not found: {self.cfg.gguf_path}")
+        if self._llm is None:
+            self._llm = Llama(
+                model_path=self.cfg.gguf_path,
+                n_ctx=self.cfg.llm_ctx,
+                n_threads=max(2, os.cpu_count() or 4),
+                verbose=False,
+            )
 
     def enhance_advice(
         self,
+        *,
         base_advice: Dict[str, Any],
         metrics: Dict[str, Any],
         shape: str,
         handedness: str,
         lang: str,
+        scoring: Dict[str, Any],
+        user_profile: Dict[str, Any],
+        log: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
         """
-        Entry point used by UI:
-          - mode rules: return base_advice
-          - mode rag: RAG compose without LLM
-          - mode rag_llm: RAG + local LLM compose
+        Return a dict compatible with rules.py UI, plus optional rag fields.
         """
         if self.cfg.mode == "rules":
-            return base_advice
+            return dict(base_advice)
 
-        query = self._make_query(metrics, shape, handedness, lang)
-        retrieved = self.retrieve(query, top_k=self.cfg.top_k)
+        self._ensure_index()
 
-        if self.cfg.mode == "rag_llm":
-            try:
-                return self._llm_compose(base_advice, retrieved, metrics, shape, handedness, lang)
-            except Exception:
-                return self._fallback_compose(base_advice, retrieved, lang)
+        topics = _route_topics(self.cfg, metrics, shape, scoring)
+        profile_txt = _short_profile(user_profile)
+        hist = _recent_log_summary(log, k=3)
 
-        return self._fallback_compose(base_advice, retrieved, lang)
+        query = _clean_text(
+            f"""
+You are an archery coach. Retrieve from the book and give actionable next-end advice.
+
+LANG={lang}
+HANDEDNESS={handedness}
+
+PROFILE:
+{profile_txt}
+
+RECENT LOG:
+{hist}
+
+METRICS:
+{json.dumps(metrics, ensure_ascii=False)}
+
+SCORING:
+{json.dumps(scoring, ensure_ascii=False)}
+
+TOPICS:
+{', '.join(topics)}
+
+Need: one cue, pass/fail, if it breaks, one 30-60s drill, a short shot script.
+""".strip()
+        )
+
+        hits = self._index.search(query, top_k=self.cfg.top_k) if self._index else []
+        snippets = "\n\n".join([f"[retrieval {i+1} score={h['score']:.3f}]\n{h['text']}" for i, h in enumerate(hits)])
+
+        # rag-only: template synthesis without LLM
+        if self.cfg.mode == "rag":
+            out = dict(base_advice)
+            out["rag"] = {"topics": topics, "top_k": self.cfg.top_k, "hits": hits[:3]}
+            # Make the wording more flexible but deterministic:
+            out["single_cue"] = base_advice.get("single_cue") or base_advice.get("cue") or _fallback_cue(lang, topics)
+            out["pass_fail"] = base_advice.get("pass_fail") or _fallback_pass_fail(lang, metrics)
+            out["fallback"] = base_advice.get("fallback") or _fallback_fallback(lang)
+            out["drill"] = base_advice.get("drill") or _fallback_drill(lang, topics)
+            out["script"] = base_advice.get("script") or _fallback_script(lang, out["single_cue"])
+            return out
+
+        # rag + local LLM
+        self._ensure_llm()
+        prompt = _build_prompt(lang, base_advice, query, snippets)
+
+        resp = self._llm(
+            prompt,
+            max_tokens=self.cfg.llm_max_tokens,
+            temperature=self.cfg.llm_temperature,
+            stop=["</json>"],
+        )
+        text = (resp["choices"][0]["text"] or "").strip()
+
+        out = dict(base_advice)
+        parsed = _try_parse_json(text)
+        if isinstance(parsed, dict):
+            out.update(parsed)
+        out["rag"] = {"topics": topics, "top_k": self.cfg.top_k, "hits": hits[:3]}
+        return out
+
+
+def _try_parse_json(s: str) -> Optional[Dict[str, Any]]:
+    m = re.search(r"\{.*\}", s, flags=re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+
+def _build_prompt(lang: str, base_advice: Dict[str, Any], query: str, snippets: str) -> str:
+    # Force a stable JSON schema so UI stays compatible
+    return _clean_text(
+        f"""
+You are a concise archery coach. Use the retrieved book snippets as grounding.
+Return STRICT JSON only, no extra text.
+
+Required keys:
+title, single_cue, pass_fail, fallback, drill{{name,how,duration_s}}, script, mental_phrase
+
+Language: {lang}
+
+Base advice:
+{json.dumps(base_advice, ensure_ascii=False)}
+
+Query context:
+{query}
+
+Retrieved:
+{snippets}
+
+Return:
+<json>
+{{...}}
+</json>
+""".strip()
+    )
+
+
+def _fallback_cue(lang: str, topics: List[str]) -> str:
+    if lang == "ja":
+        return "次の6射は「同じテンポ」だけを守る。"
+    if lang == "zh":
+        return "下一组只盯一件事：节奏一致。"
+    return "Next end: protect ONE thing—identical tempo."
+
+
+def _fallback_pass_fail(lang: str, metrics: Dict[str, Any]) -> str:
+    if lang == "ja":
+        return "PASS: セットアップ→アンカーまで違和感なし / FAIL: 3秒で落ち着かなければ必ず下ろす"
+    if lang == "zh":
+        return "PASS：举弓到锚点无明显别扭；FAIL：3秒内不稳定就必须放下重来"
+    return "PASS: set-up→anchor feels identical; FAIL: if not settling within 3s, always let down."
+
+
+def _fallback_fallback(lang: str) -> str:
+    if lang == "ja":
+        return "崩れたら：矢は撃たず、空打ちでフォームだけ1回リセット。"
+    if lang == "zh":
+        return "一旦崩了：别硬放箭，空拉一次把动作重置。"
+    return "If it breaks: no shot—one blank-bale rep to reset the feel."
+
+
+def _fallback_drill(lang: str, topics: List[str]) -> Dict[str, Any]:
+    if lang == "ja":
+        return {"name": "60秒：テンポ固定", "how": "3秒以内に決まらなければ下ろす。×6回。", "duration_s": 60}
+    if lang == "zh":
+        return {"name": "60秒：节奏固定", "how": "3秒内不稳定就放下重来。做6次。", "duration_s": 60}
+    return {"name": "60s: Tempo lock", "how": "If not settling within 3s, let down. x6 reps.", "duration_s": 60}
+
+
+def _fallback_script(lang: str, cue: str) -> str:
+    if lang == "ja":
+        return f"セット→引き分け→アンカー→{cue}→リリース→フォロー"
+    if lang == "zh":
+        return f"举弓→开弓→锚点→{cue}→撒放→随动"
+    return f"Set → Draw → Anchor → {cue} → Release → Follow-through"
