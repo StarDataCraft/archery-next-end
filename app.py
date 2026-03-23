@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 
 from src.state import init_state, goto_step
@@ -10,7 +11,6 @@ st.set_page_config(page_title="Archery Next End Coach", layout="wide")
 
 def main():
     init_state()
-
     step = st.session_state.step
 
     if step == "language":
