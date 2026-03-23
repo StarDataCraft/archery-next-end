@@ -15,9 +15,7 @@ from .storage import make_log_entry, export_log_json
 from .cv_target import rectify_target, transform_points, propose_hit_points
 from .refine_points import refine_points_and_colors, sample_contact_color_hsv
 from .scoring import score_hits_color_aware
-from .target_face import render_target_face_bgr
-
-# NEW: flexible coach (RAG / local LLM)
+from .target_face import render_target_face_bgr, TARGET_FACES
 from .coach import CoachRAG, CoachConfig
 
 CANON_SIZE = 900
@@ -82,91 +80,130 @@ def _draw_hits_on_face(face_bgr, points_xy, scores):
 
 
 def _canon_to_rect_points(points_xy, M_rect_to_canon):
-    """
-    Convert canonical points back to rect points using inverse affine.
-    """
     if not points_xy:
         return []
     if M_rect_to_canon is None:
         raise TypeError("M_rect_to_canon is None (cannot invert affine transform).")
-
     if not isinstance(M_rect_to_canon, np.ndarray):
-        try:
-            M_rect_to_canon = np.array(M_rect_to_canon, dtype=np.float32)
-        except Exception as e:
-            raise TypeError(f"M_rect_to_canon cannot be converted to np.ndarray: {type(M_rect_to_canon)}") from e
-
+        M_rect_to_canon = np.array(M_rect_to_canon, dtype=np.float32)
     if M_rect_to_canon.shape != (2, 3):
         raise TypeError(f"M_rect_to_canon must be shape (2,3), got {M_rect_to_canon.shape}")
-
     Minv = cv2.invertAffineTransform(M_rect_to_canon.astype(np.float32))
     pts = np.array(points_xy, dtype=np.float32).reshape(-1, 1, 2)
     out = cv2.transform(pts, Minv).reshape(-1, 2)
     return [(float(x), float(y)) for x, y in out]
 
 
+def _read_image_from_uploader_or_camera() -> tuple[np.ndarray | None, str | None]:
+    """
+    Returns (img_rgb, cache_key) or (None, None)
+    """
+    lang = st.session_state.language
+
+    # input mode selector
+    st.session_state.image_mode = st.radio(
+        t("input_mode", lang),
+        options=["upload", "camera"],
+        horizontal=True,
+        index=0 if st.session_state.image_mode == "upload" else 1,
+        format_func=lambda x: t("mode_upload", lang) if x == "upload" else t("mode_camera", lang),
+    )
+
+    if st.session_state.image_mode == "upload":
+        st.subheader(t("upload", lang))
+        file = st.file_uploader("", type=["png", "jpg", "jpeg"])
+        if not file:
+            return None, None
+        img_pil = Image.open(file).convert("RGB")
+        img_rgb = np.array(img_pil, dtype=np.uint8)
+        cache_key = f"upload-{getattr(file, 'name', 'file')}-{img_rgb.shape[0]}x{img_rgb.shape[1]}"
+        return img_rgb, cache_key
+
+    # camera mode
+    st.subheader(t("camera", lang))
+    cam = st.camera_input("")
+    if not cam:
+        return None, None
+    img_pil = Image.open(cam).convert("RGB")
+    img_rgb = np.array(img_pil, dtype=np.uint8)
+    cache_key = f"camera-{int(cam.size)}-{img_rgb.shape[0]}x{img_rgb.shape[1]}"
+    return img_rgb, cache_key
+
+
 def render_analyze_step():
     lang = st.session_state.language
     st.title(t("title", lang))
 
-    top1, top2, top3 = st.columns([1, 1, 1.4])
+    # -------------------------
+    # Top controls
+    # -------------------------
+    top1, top2, top3 = st.columns([1, 1, 1.7])
     with top1:
         st.session_state.distance_m = st.number_input(
-            t("distance", lang),
-            min_value=3,
-            max_value=90,
-            value=int(st.session_state.distance_m),
-            step=1,
+            t("distance", lang), min_value=3, max_value=90, value=int(st.session_state.distance_m), step=1
         )
     with top2:
         st.session_state.arrows_per_end = st.number_input(
-            t("arrows", lang),
-            min_value=3,
-            max_value=12,
-            value=int(st.session_state.arrows_per_end),
-            step=1,
+            t("arrows", lang), min_value=3, max_value=12, value=int(st.session_state.arrows_per_end), step=1
         )
     with top3:
+        face_keys = list(TARGET_FACES.keys())
+        if st.session_state.target_face not in face_keys:
+            st.session_state.target_face = face_keys[0]
+
         face = st.selectbox(
             t("target_face", lang),
-            options=["80cm_10ring", "40cm_10ring"],
-            index=0 if st.session_state.target_face == "80cm_10ring" else 1,
-            format_func=lambda x: t("target_80", lang) if x == "80cm_10ring" else t("target_40", lang),
+            options=face_keys,
+            index=face_keys.index(st.session_state.target_face),
+            format_func=lambda k: t(TARGET_FACES[k]["label_key"], lang),
         )
         if face != st.session_state.target_face:
             st.session_state.target_face = face
             st.session_state.last_result = None
             st.session_state.overlay_image_rgb = None
 
-    # ------------------------------------------------------------------
-    # (A) NEW: Coach settings (flexible text via book PDF on GitHub)
-    # ------------------------------------------------------------------
-    with st.expander("Coaching (flexible text)"):
-        # Ensure defaults exist even if state.py not yet updated
-        if "coach_mode" not in st.session_state:
-            st.session_state.coach_mode = "rag"
-        if "coach_pdf_path" not in st.session_state:
-            st.session_state.coach_pdf_path = "docs/Archery_The_Art_of_Repetition.pdf"
-        if "coach_gguf_path" not in st.session_state:
-            st.session_state.coach_gguf_path = "models/llm.gguf"
+    # -------------------------
+    # Profile + Coach settings
+    # -------------------------
+    with st.expander(t("profile", lang), expanded=False):
+        p = st.session_state.user_profile
 
+        p["name"] = st.text_input(t("profile_name", lang), value=p.get("name", ""))
+        p["bow"] = st.selectbox(t("profile_bow", lang), options=["recurve", "compound", "barebow"], index=["recurve", "compound", "barebow"].index(p.get("bow", "recurve")))
+        p["experience_months"] = st.number_input(t("profile_exp", lang), min_value=0, max_value=600, value=int(p.get("experience_months", 0)), step=1)
+        p["dominant_eye"] = st.text_input(t("profile_eye", lang), value=p.get("dominant_eye", ""))
+        p["goals"] = st.text_area(t("profile_goals", lang), value=p.get("goals", ""), height=80)
+        p["recurring_issues"] = st.text_area(t("profile_issues", lang), value=p.get("recurring_issues", ""), height=80)
+        p["constraints"] = st.text_area(t("profile_constraints", lang), value=p.get("constraints", ""), height=80)
+
+        style_map = {"tight": "style_tight", "gentle": "style_gentle", "technical": "style_technical"}
+        style_keys = list(style_map.keys())
+        p["language_style"] = st.selectbox(
+            t("profile_style", lang),
+            options=style_keys,
+            index=style_keys.index(p.get("language_style", "tight")),
+            format_func=lambda k: t(style_map[k], lang),
+        )
+        st.session_state.user_profile = p
+
+    with st.expander("Coaching (RAG/LLM)", expanded=False):
         st.session_state.coach_mode = st.selectbox(
             "Mode",
             options=["rules", "rag", "rag_llm"],
             index=["rules", "rag", "rag_llm"].index(st.session_state.coach_mode),
-            help="rules: fixed template; rag: book-guided retrieval; rag_llm: retrieval + local GGUF model",
         )
-        st.session_state.coach_pdf_path = st.text_input(
-            "PDF path in repo",
-            value=st.session_state.coach_pdf_path,
-            help="Example: docs/Archery_The_Art_of_Repetition.pdf",
+        st.session_state.coach_router = st.selectbox(
+            "Router",
+            options=["coarse", "fine"],
+            index=["coarse", "fine"].index(st.session_state.coach_router),
+            help="fine: topic routing uses metrics/offset/slope/avg score for sharper retrieval",
         )
-        st.session_state.coach_gguf_path = st.text_input(
-            "Local GGUF (optional)",
-            value=st.session_state.coach_gguf_path,
-            help="Used only when mode=rag_llm, e.g. models/llm.gguf",
-        )
+        st.session_state.coach_pdf_path = st.text_input("PDF path in repo", value=st.session_state.coach_pdf_path)
+        st.session_state.coach_gguf_path = st.text_input("Local GGUF (optional)", value=st.session_state.coach_gguf_path)
 
+    # -------------------------
+    # Nav buttons
+    # -------------------------
     colA, colB = st.columns([1, 1])
     with colA:
         if st.button(t("back", lang), use_container_width=True):
@@ -179,17 +216,20 @@ def render_analyze_step():
             st.rerun()
 
     st.divider()
-    st.subheader(t("upload", lang))
-    file = st.file_uploader("", type=["png", "jpg", "jpeg"])
-    if not file:
-        st.info("Upload → rectify → propose → refine → map → confirm → analyze")
+
+    # -------------------------
+    # Upload / Camera
+    # -------------------------
+    img_rgb, cache_key = _read_image_from_uploader_or_camera()
+    if img_rgb is None:
+        st.info("Upload/Camera → rectify → propose → refine → map → confirm → analyze")
         return
 
-    img_pil = Image.open(file).convert("RGB")
-    img_rgb = np.array(img_pil, dtype=np.uint8)
-    cache_key = f"{getattr(file, 'name', 'upload')}-{img_rgb.shape[0]}x{img_rgb.shape[1]}"
     need = int(st.session_state.arrows_per_end)
 
+    # -------------------------
+    # CV pipeline (cached)
+    # -------------------------
     if st.session_state.get("cv_cache_key") != cache_key:
         rect_res = rectify_target(img_rgb, out_size=CANON_SIZE)
 
@@ -203,10 +243,7 @@ def render_analyze_step():
         )
 
         coarse = propose_hit_points(
-            rect_res.rect_bgr,
-            rect_res.center_final,
-            rect_res.arrow_present,
-            max_points=max(need, 12),
+            rect_res.rect_bgr, rect_res.center_final, rect_res.arrow_present, max_points=max(need, 12)
         )
 
         refined_rect_pts, _ = refine_points_and_colors(
@@ -230,10 +267,7 @@ def render_analyze_step():
         st.session_state._rect_photo_bgr = rect_res.rect_bgr.copy()
         st.session_state._M_rect_to_canon = rect_res.M_rect_to_canon.copy()
         st.session_state.warp_debug = rect_res.debug
-        st.session_state.cv_quality = {
-            "score": float(rect_res.quality_score),
-            "flags": list(rect_res.quality_flags),
-        }
+        st.session_state.cv_quality = {"score": float(rect_res.quality_score), "flags": list(rect_res.quality_flags)}
 
     bg_rgb = st.session_state.overlay_image_rgb
     auto_pts = st.session_state.auto_points
@@ -274,95 +308,88 @@ def render_analyze_step():
     with col2:
         save_clicked = st.button(t("save_log", lang), use_container_width=True)
 
+    # -------------------------
+    # Analyze
+    # -------------------------
     if analyze_clicked:
-        try:
-            if len(points) < need:
-                st.warning(t("need_points", lang))
-                return
-
-            pts_xy = [(p["x"], p["y"]) for p in points[:need]]
-
-            # ---- color-aware scoring: map canonical points back to rectified photo, sample HSV there ----
-            rect_bgr = st.session_state._rect_photo_bgr
-            M_rect_to_canon = st.session_state._M_rect_to_canon
-            rect_pts = _canon_to_rect_points(pts_xy, M_rect_to_canon)
-
-            hsvs = []
-            for (rx, ry) in rect_pts:
-                hsv = sample_contact_color_hsv(rect_bgr, (rx, ry), roi_radius=18)
-                if hsv is None:
-                    hsvs.append(None)
-                else:
-                    hsvs.append(hsv)
-
-            scoring = score_hits_color_aware(center, outer, pts_xy, contact_hsvs=hsvs)
-
-            metrics = compute_metrics(points[:need], center=center, outer_radius_px=outer)
-            shape = classify_shape(metrics)
-
-            # ------------------------------------------------------------------
-            # (B) NEW: base advice from rules -> enhance via RAG / optional LLM
-            # ------------------------------------------------------------------
-            base_advice = next_end_advice(
-                metrics,
-                shape,
-                st.session_state.handedness,
-                lang=lang,
-                quality=quality,
-            )
-
-            cfg = CoachConfig(
-                pdf_path=st.session_state.coach_pdf_path,
-                mode=st.session_state.coach_mode,
-                gguf_path=st.session_state.coach_gguf_path,
-            )
-            coach = CoachRAG(cfg)
-
-            try:
-                advice = coach.enhance_advice(
-                    base_advice=base_advice,
-                    metrics=metrics,
-                    shape=shape,
-                    handedness=st.session_state.handedness,
-                    lang=lang,
-                )
-            except Exception as e:
-                advice = dict(base_advice)
-                advice["rag_error"] = str(e)
-
-            face_bgr = cv2.cvtColor(bg_rgb, cv2.COLOR_RGB2BGR)
-            overlay_hits = _draw_hits_on_face(face_bgr, pts_xy, scoring["scores"])
-            overlay_hits_rgb = _bgr_to_rgb_uint8(overlay_hits)
-
-            st.session_state.last_result = {
-                "metrics": metrics,
-                "shape": shape,
-                "advice": advice,
-                "scoring": scoring,
-                "overlay_hits_rgb": overlay_hits_rgb,
-                "quality": quality,
-                "color_debug": scoring.get("details", []),
-            }
-            st.rerun()
-
-        except Exception as e:
-            st.error("Analyze crashed.")
-            st.exception(e)
+        if len(points) < need:
+            st.warning(t("need_points", lang))
             return
 
+        pts_xy = [(p["x"], p["y"]) for p in points[:need]]
+
+        rect_bgr = st.session_state._rect_photo_bgr
+        M_rect_to_canon = st.session_state._M_rect_to_canon
+        rect_pts = _canon_to_rect_points(pts_xy, M_rect_to_canon)
+
+        hsvs = []
+        for rp in rect_pts:
+            try:
+                hsv = sample_contact_color_hsv(rect_bgr, rp, roi_radius=18)
+            except TypeError:
+                hsv = sample_contact_color_hsv(rect_bgr, rp[0], rp[1], r=10)
+            hsvs.append(hsv)
+
+        scoring = score_hits_color_aware(center, outer, pts_xy, contact_hsvs=hsvs)
+
+        metrics = compute_metrics(points[:need], center=center, outer_radius_px=outer)
+        shape = classify_shape(metrics)
+
+        base_advice = next_end_advice(metrics, shape, st.session_state.handedness, lang=lang, quality=quality)
+
+        # Coach enhancement (router uses profile+log)
+        cfg = CoachConfig(
+            pdf_path=st.session_state.coach_pdf_path,
+            mode=st.session_state.coach_mode,
+            gguf_path=st.session_state.coach_gguf_path,
+            router=st.session_state.coach_router,
+        )
+        coach = CoachRAG(cfg)
+        try:
+            advice = coach.enhance_advice(
+                base_advice=base_advice,
+                metrics=metrics,
+                shape=shape,
+                handedness=st.session_state.handedness,
+                lang=lang,
+                scoring=scoring,
+                user_profile=st.session_state.user_profile,
+                log=st.session_state.log,
+            )
+        except Exception as e:
+            advice = dict(base_advice)
+            advice["rag_error"] = str(e)
+
+        face_bgr = cv2.cvtColor(bg_rgb, cv2.COLOR_RGB2BGR)
+        overlay_hits = _draw_hits_on_face(face_bgr, pts_xy, scoring["scores"])
+        overlay_hits_rgb = _bgr_to_rgb_uint8(overlay_hits)
+
+        st.session_state.last_result = {
+            "metrics": metrics,
+            "shape": shape,
+            "advice": advice,
+            "scoring": scoring,
+            "overlay_hits_rgb": overlay_hits_rgb,
+            "quality": quality,
+            "color_debug": scoring.get("details", []),
+        }
+        st.rerun()
+
+    # -------------------------
+    # Result UI
+    # -------------------------
     if st.session_state.last_result:
         res = st.session_state.last_result
         metrics = res["metrics"]
         scoring = res["scoring"]
         advice = res["advice"]
-        quality = res.get("quality", None)
         offset = metrics.get("offset", {}) or {}
 
         st.divider()
-        st.subheader("Overlay (standard face + hits + scores)")
+        st.subheader("Overlay (face + hits + scores)")
         st.image(res["overlay_hits_rgb"], use_container_width=False)
 
-        st.subheader("Score (color-aware)")
+        st.subheader("Score")
         st.write(f"- Total: **{scoring['total']}** / {need * 10}")
         st.write(f"- Avg: **{scoring['avg']:.2f}**")
         st.write(f"- Per arrow: {scoring['scores']}")
@@ -370,21 +397,15 @@ def render_analyze_step():
         with st.expander("Per-arrow debug (radial vs color band)"):
             st.write(res.get("color_debug", []))
 
-        st.subheader("Grouping metrics (reference)")
+        st.subheader("Grouping metrics")
         st.write(f"- Shape: **{res['shape']}**")
         st.write(f"- Spread (avg): **{metrics['spread']:.1f} px**")
         st.write(f"- Direction: **{metrics['slope_deg']:.0f}°**")
         st.write(f"- Offset dx/dy: **{offset.get('dx', 0.0):.1f} / {offset.get('dy', 0.0):.1f} px**")
-        if quality is not None:
-            st.write(f"- CV quality: **{float(quality.get('score', 1.0)):.2f}** ({quality.get('flags', [])})")
 
-        # ------------------------------------------------------------------
-        # (C) NEW: display advice fields (rules-compatible + rag-enhanced)
-        # ------------------------------------------------------------------
-        st.subheader("Next end coaching (flexible)")
+        st.subheader("Next end coaching")
         st.markdown(f"**{advice.get('title', '')}**")
 
-        # Prefer enhanced fields; fall back to old keys if needed
         single_cue = advice.get("single_cue", advice.get("cue", ""))
         pass_fail = advice.get("pass_fail", "")
         fallback = advice.get("fallback", "")
@@ -404,10 +425,7 @@ def render_analyze_step():
             name = drill.get("name", "")
             how = drill.get("how", "")
             if name:
-                if dur is not None:
-                    st.markdown(f"**Immediate drill ({dur}s)**: {name}")
-                else:
-                    st.markdown(f"**Immediate drill**: {name}")
+                st.markdown(f"**Immediate drill**: {name}" + (f" ({dur}s)" if dur is not None else ""))
             if how:
                 st.markdown(how)
 
@@ -418,12 +436,14 @@ def render_analyze_step():
             with st.expander("Shot Script (compact)"):
                 st.code(script, language="text")
 
-        # RAG debug (if present)
         with st.expander("RAG debug"):
-            st.write(advice.get("rag", None))
             if "rag_error" in advice:
                 st.warning(advice["rag_error"])
+            st.write(advice.get("rag", None))
 
+    # -------------------------
+    # Save log
+    # -------------------------
     if save_clicked:
         if not st.session_state.last_result:
             st.warning("Analyze first.")
