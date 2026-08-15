@@ -58,6 +58,31 @@ TEXT = {
         "en": "No hit candidates were found. Click the target to add the hit positions manually.",
         "zh": "未检测到命中点，请点击靶面手动添加点位。",
     },
+    "source_preview": {
+        "ja": "アップロード写真を確認",
+        "en": "Check uploaded photo",
+        "zh": "查看上传的照片",
+    },
+    "source_photo": {
+        "ja": "元の写真",
+        "en": "Uploaded photo",
+        "zh": "上传的原图",
+    },
+    "mapped_target_hint": {
+        "ja": "下の画像は補正後の的です。点が足りない場合はクリックで追加し、必要数に達したらドラッグで調整できます。",
+        "en": "This is the aligned target. Click to add missing points; once the count is met, drag points to adjust them.",
+        "zh": "下图是校正后的靶面；点位不足时点击添加，达到所需数量后可拖动调整。",
+    },
+    "analysis_error": {
+        "ja": "分析を完了できませんでした。点の位置は保持されています。",
+        "en": "Analysis could not be completed. Your marked points have been kept.",
+        "zh": "分析未能完成，已标记的点位仍然保留。",
+    },
+    "analysis_error_hint": {
+        "ja": "点を確認してもう一度お試しください。問題が続く場合は別の写真を使用してください。",
+        "en": "Check the points and try again. If it continues, use another photo.",
+        "zh": "请检查点位后重试；若问题持续，请更换照片。",
+    },
     "marked": {
         "ja": "指定済み: **{count}** / {need}",
         "en": "Marked: **{count}** / {need}",

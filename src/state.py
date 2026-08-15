@@ -19,6 +19,7 @@ DEFAULTS = {
 
     # user-confirmed hit points
     "points": [],  # list of dicts: {"x": float, "y": float}
+    "canvas_revision": 0,
 
     # last result: metrics + scoring + advice
     "last_result": None,
@@ -46,7 +47,7 @@ DEFAULTS = {
     },
 
     # NEW: coach settings
-    "coach_mode": "rag",  # "rules" | "rag" | "rag_llm"
+    "coach_mode": "rules",  # "rules" | "rag" | "rag_llm"
     "coach_pdf_path": "docs/Archery The Art of Repetition (Simon Needham ).pdf",
     "coach_gguf_path": "models/llm.gguf",
     "coach_router": "fine",  # "coarse" | "fine"

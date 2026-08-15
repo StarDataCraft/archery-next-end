@@ -39,12 +39,19 @@ def compute_metrics(
     sx = float(xy[:, 0].std(ddof=0))
     sy = float(xy[:, 1].std(ddof=0))
 
-    # principal axis direction
-    cov = np.cov(xy.T, ddof=0)
-    vals, vecs = np.linalg.eig(cov)
-    main_vec = vecs[:, int(np.argmax(vals))]
-    slope_rad = float(np.arctan2(main_vec[1], main_vec[0]))
-    slope_deg = float(slope_rad * 180.0 / np.pi)
+    # Principal-axis direction. ``eigh`` is the correct solver for this real,
+    # symmetric covariance matrix and always returns real eigenvectors. Some
+    # NumPy/LAPACK builds return complex values from the generic ``eig`` even
+    # when the imaginary part is zero, which makes ``arctan2`` fail.
+    slope_deg = 0.0
+    if len(points) >= 2:
+        cov = np.cov(xy.T, ddof=0)
+        cov = (cov + cov.T) / 2.0
+        if np.isfinite(cov).all():
+            vals, vecs = np.linalg.eigh(cov)
+            main_vec = vecs[:, int(np.argmax(vals))]
+            slope_rad = float(np.arctan2(main_vec[1], main_vec[0]))
+            slope_deg = float(slope_rad * 180.0 / np.pi)
 
     # offset from target center (if provided)
     dx = dy = mag = 0.0
