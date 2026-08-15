@@ -47,7 +47,7 @@ DEFAULTS = {
     },
 
     # NEW: coach settings
-    "coach_mode": "rules",  # "rules" | "rag" | "rag_llm"
+    "coach_mode": "book",  # "book" | "rules"
     "coach_pdf_path": "docs/Archery The Art of Repetition (Simon Needham ).pdf",
     "coach_gguf_path": "models/llm.gguf",
     "coach_router": "fine",  # "coarse" | "fine"

@@ -259,20 +259,19 @@ def render_analyze_step():
         )
         st.session_state.user_profile = p
 
-    with st.expander("Coaching (RAG/LLM)", expanded=False):
+    with st.expander(t("coach_settings", lang), expanded=False):
+        # Migrate sessions created before book-guided coaching became the
+        # default. Old RAG modes required unavailable cloud dependencies.
+        if st.session_state.coach_mode not in {"book", "rules"}:
+            st.session_state.coach_mode = "book"
         st.session_state.coach_mode = st.selectbox(
-            "Mode",
-            options=["rules", "rag", "rag_llm"],
-            index=["rules", "rag", "rag_llm"].index(st.session_state.coach_mode),
+            t("coach_mode", lang),
+            options=["book", "rules"],
+            index=["book", "rules"].index(st.session_state.coach_mode),
+            format_func=lambda key: t(f"coach_{key}", lang),
         )
-        st.session_state.coach_router = st.selectbox(
-            "Router",
-            options=["coarse", "fine"],
-            index=["coarse", "fine"].index(st.session_state.coach_router),
-            help="fine: topic routing uses metrics/offset/slope/avg score for sharper retrieval",
-        )
-        st.session_state.coach_pdf_path = st.text_input("PDF path in repo", value=st.session_state.coach_pdf_path)
-        st.session_state.coach_gguf_path = st.text_input("Local GGUF (optional)", value=st.session_state.coach_gguf_path)
+        if st.session_state.coach_mode == "book":
+            st.caption(t("coach_book_caption", lang))
 
     # -------------------------
     # Nav buttons
@@ -472,6 +471,7 @@ def render_analyze_step():
                     scoring=scoring,
                     user_profile=st.session_state.user_profile,
                     log=st.session_state.log,
+                    quality=quality,
                 )
             except Exception as exc:
                 advice = dict(base_advice)
@@ -509,10 +509,10 @@ def render_analyze_step():
         offset = metrics.get("offset", {}) or {}
 
         st.divider()
-        st.subheader("Overlay (face + hits + scores)")
+        st.subheader(t("result_overlay", lang))
         st.image(res["overlay_hits_rgb"], width=CANVAS_SIZE)
 
-        st.subheader("Score")
+        st.subheader(t("result_score", lang))
         st.write(f"- Total: **{scoring['total']}** / {need * 10}")
         st.write(f"- Avg: **{scoring['avg']:.2f}**")
         st.write(f"- Per arrow: {scoring['scores']}")
@@ -520,13 +520,13 @@ def render_analyze_step():
         with st.expander("Per-arrow debug (radial vs color band)"):
             st.write(res.get("color_debug", []))
 
-        st.subheader("Grouping metrics")
+        st.subheader(t("result_metrics", lang))
         st.write(f"- Shape: **{res['shape']}**")
         st.write(f"- Spread (avg): **{metrics['spread']:.1f} px**")
         st.write(f"- Direction: **{metrics['slope_deg']:.0f}°**")
         st.write(f"- Offset dx/dy: **{offset.get('dx', 0.0):.1f} / {offset.get('dy', 0.0):.1f} px**")
 
-        st.subheader("Next end coaching")
+        st.subheader(t("coach_next", lang))
         st.markdown(f"**{advice.get('title', '')}**")
 
         single_cue = advice.get("single_cue", advice.get("cue", ""))
@@ -535,12 +535,22 @@ def render_analyze_step():
         mental = advice.get("mental_phrase", "")
         script = advice.get("script", "")
 
+        diagnosis = advice.get("diagnosis", {}) or {}
+        if diagnosis:
+            st.markdown(f"**{t('coach_evidence', lang)}**: {diagnosis.get('evidence', '')}")
+            st.caption(f"{t('coach_handedness', lang)}: {diagnosis.get('handedness_context', '')}")
+            st.caption(f"{t('coach_trend', lang)}: {diagnosis.get('trend', '')}")
+
+        why = advice.get("why", "")
+        if why:
+            st.markdown(f"**{t('coach_why', lang)}**: {why}")
+
         if single_cue:
-            st.markdown(f"**One cue**: {single_cue}")
+            st.markdown(f"**{t('coach_one_cue', lang)}**: {single_cue}")
         if pass_fail:
-            st.markdown(f"**PASS/FAIL**: {pass_fail}")
+            st.markdown(f"**{t('coach_pass_fail', lang)}**: {pass_fail}")
         if fallback:
-            st.markdown(f"**If it breaks**: {fallback}")
+            st.markdown(f"**{t('coach_fallback', lang)}**: {fallback}")
 
         drill = advice.get("drill", {}) or {}
         if isinstance(drill, dict) and drill:
@@ -548,21 +558,29 @@ def render_analyze_step():
             name = drill.get("name", "")
             how = drill.get("how", "")
             if name:
-                st.markdown(f"**Immediate drill**: {name}" + (f" ({dur}s)" if dur is not None else ""))
+                st.markdown(f"**{t('coach_drill', lang)}**: {name}" + (f" ({dur}s)" if dur is not None else ""))
             if how:
                 st.markdown(how)
 
         if mental:
-            st.markdown(f"**Mental phrase**: {mental}")
+            st.markdown(f"**{t('coach_mental', lang)}**: {mental}")
 
         if script:
-            with st.expander("Shot Script (compact)"):
+            with st.expander(t("coach_script", lang)):
                 st.code(script, language="text")
 
-        with st.expander("RAG debug"):
+        source = advice.get("book_source", {}) or {}
+        if source:
+            with st.expander(t("coach_source", lang), expanded=True):
+                st.markdown(f"**{source.get('title', '')}**")
+                st.write(source.get("chapter", ""))
+                st.write(f"{t('coach_pdf_pages', lang)}: {source.get('pdf_pages', '')}")
+                st.caption(source.get("summary", ""))
+
+        with st.expander(t("coach_details", lang)):
             if "rag_error" in advice:
                 st.warning(advice["rag_error"])
-            st.write(advice.get("rag", None))
+            st.write({"diagnosis": diagnosis, "source": source})
 
     # -------------------------
     # Save log

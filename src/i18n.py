@@ -120,6 +120,33 @@ TEXT = {
     "style_tight": {"ja": "短く厳密", "en": "Tight & precise", "zh": "短而精准"},
     "style_gentle": {"ja": "やさしく", "en": "Gentle", "zh": "温和"},
     "style_technical": {"ja": "技術的", "en": "Technical", "zh": "技术向"},
+
+    "coach_settings": {"ja": "コーチング方法", "en": "Coaching method", "zh": "教练方式"},
+    "coach_mode": {"ja": "アドバイスの根拠", "en": "Advice source", "zh": "建议依据"},
+    "coach_book": {"ja": "書籍に基づく（推奨）", "en": "Book-guided (recommended)", "zh": "依据书籍（推荐）"},
+    "coach_rules": {"ja": "基本ルールのみ", "en": "Basic rules only", "zh": "仅基础规则"},
+    "coach_book_caption": {
+        "ja": "『Archery: The Art of Repetition』の確認済みテーマとPDFページを使います。外部AIは不要です。",
+        "en": "Uses reviewed themes and PDF pages from Archery: The Art of Repetition. No external AI is required.",
+        "zh": "使用《Archery: The Art of Repetition》中已核对的主题与 PDF 页码，不依赖外部 AI。",
+    },
+    "result_overlay": {"ja": "着弾結果", "en": "Hit result", "zh": "命中结果"},
+    "result_score": {"ja": "得点", "en": "Score", "zh": "得分"},
+    "result_metrics": {"ja": "グループ指標", "en": "Grouping metrics", "zh": "箭群指标"},
+    "coach_next": {"ja": "次のエンドのコーチング", "en": "Next-end coaching", "zh": "下一组教练建议"},
+    "coach_why": {"ja": "今回この提案をする理由", "en": "Why this advice", "zh": "为什么是这条建议"},
+    "coach_evidence": {"ja": "判定根拠", "en": "Observed evidence", "zh": "判定依据"},
+    "coach_handedness": {"ja": "左右の対応", "en": "Side mapping", "zh": "左右手对应"},
+    "coach_trend": {"ja": "前回との変化", "en": "Change from last saved end", "zh": "与上一组的变化"},
+    "coach_one_cue": {"ja": "一つの合図", "en": "One cue", "zh": "唯一口令"},
+    "coach_pass_fail": {"ja": "合格 / 失敗", "en": "Pass / fail", "zh": "通过 / 失败"},
+    "coach_fallback": {"ja": "崩れたら", "en": "If it breaks", "zh": "崩了就做"},
+    "coach_drill": {"ja": "すぐ行う練習", "en": "Immediate drill", "zh": "立即练习"},
+    "coach_mental": {"ja": "メンタルの一言", "en": "Mental phrase", "zh": "心理口令"},
+    "coach_script": {"ja": "コンパクト射順", "en": "Compact shot script", "zh": "简短动作脚本"},
+    "coach_source": {"ja": "書籍で確認する", "en": "Check in the book", "zh": "书中依据"},
+    "coach_pdf_pages": {"ja": "PDFページ", "en": "PDF pages", "zh": "PDF 页码"},
+    "coach_details": {"ja": "診断と出典の詳細", "en": "Diagnosis and source details", "zh": "诊断与出处详情"},
 }
 
 def t(key: str, lang: str) -> str:

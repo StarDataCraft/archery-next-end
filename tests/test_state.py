@@ -18,7 +18,7 @@ class SessionStateTests(unittest.TestCase):
 
         self.assertEqual(second_session["log"], [])
         self.assertEqual(second_session["user_profile"]["name"], "")
-        self.assertEqual(second_session["coach_mode"], "rules")
+        self.assertEqual(second_session["coach_mode"], "book")
 
 
 if __name__ == "__main__":
