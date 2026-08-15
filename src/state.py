@@ -47,6 +47,7 @@ DEFAULTS = {
     },
 
     # NEW: coach settings
+    "coach_version": 2,
     "coach_mode": "book",  # "book" | "rules"
     "coach_pdf_path": "docs/Archery The Art of Repetition (Simon Needham ).pdf",
     "coach_gguf_path": "models/llm.gguf",
@@ -55,11 +56,16 @@ DEFAULTS = {
 
 
 def init_state():
+    needs_coach_migration = "coach_version" not in st.session_state
     for k, v in DEFAULTS.items():
         if k not in st.session_state:
             # Lists and profile dictionaries must not be shared by concurrent
             # Streamlit sessions.
             st.session_state[k] = deepcopy(v)
+    if needs_coach_migration:
+        # Sessions created before v2 defaulted to the four-template rules
+        # coach. Migrate once; later user choices between book/rules persist.
+        st.session_state["coach_mode"] = "book"
 
 
 def reset_shot():
