@@ -4,6 +4,8 @@ from src.ui_analyze import (
     CANON_SIZE,
     CANVAS_SIZE,
     _extract_points_from_canvas,
+    _image_data_url,
+    _points_to_initial_drawing,
     _sanitize_canonical_points,
     _scale_points,
     _update_points_from_canvas,
@@ -11,6 +13,19 @@ from src.ui_analyze import (
 
 
 class CanvasPointTests(unittest.TestCase):
+    def test_embedded_canvas_background_is_noninteractive(self):
+        import numpy as np
+
+        background = np.zeros((4, 5, 3), dtype=np.uint8)
+        drawing = _points_to_initial_drawing([], background_rgb=background)
+        image_object = drawing["objects"][0]
+
+        self.assertEqual(image_object["type"], "image")
+        self.assertFalse(image_object["selectable"])
+        self.assertFalse(image_object["evented"])
+        self.assertTrue(image_object["src"].startswith("data:image/png;base64,"))
+        self.assertEqual(_image_data_url(background), image_object["src"])
+
     def test_canonical_canvas_round_trip(self):
         canonical = [{"x": 450.0, "y": 225.0}, {"x": 900.0, "y": 0.0}]
 

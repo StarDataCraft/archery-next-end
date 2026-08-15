@@ -1,7 +1,9 @@
 # src/ui_analyze.py
 from __future__ import annotations
 
+import base64
 import hashlib
+import io
 import logging
 
 import streamlit as st
@@ -46,8 +48,39 @@ def _bgr_to_rgb_uint8(bgr: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.uint8)
 
 
-def _points_to_initial_drawing(points, r=10):
+def _image_data_url(image_rgb: np.ndarray) -> str:
+    buffer = io.BytesIO()
+    Image.fromarray(image_rgb).save(buffer, format="PNG", optimize=True)
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _points_to_initial_drawing(points, r=10, background_rgb: np.ndarray | None = None):
     objects = []
+    if background_rgb is not None:
+        height, width = background_rgb.shape[:2]
+        objects.append(
+            {
+                "type": "image",
+                "version": "4.4.0",
+                "originX": "left",
+                "originY": "top",
+                "left": 0,
+                "top": 0,
+                "width": int(width),
+                "height": int(height),
+                "scaleX": 1,
+                "scaleY": 1,
+                "angle": 0,
+                "opacity": 1,
+                "selectable": False,
+                "evented": False,
+                "hasControls": False,
+                "hasBorders": False,
+                "src": _image_data_url(background_rgb),
+                "filters": [],
+            }
+        )
     for (x, y) in points:
         objects.append(
             {
@@ -397,22 +430,25 @@ def render_analyze_step():
 
     canonical_points = _sanitize_canonical_points(st.session_state.points)
     canvas_points = _scale_points(canonical_points, CANVAS_SIZE / CANON_SIZE)
-    initial = _points_to_initial_drawing(
-        [(point["x"], point["y"]) for point in canvas_points],
-        r=8,
-    )
-
     canvas_bg_rgb = cv2.resize(
         bg_rgb,
         (CANVAS_SIZE, CANVAS_SIZE),
         interpolation=cv2.INTER_AREA,
+    )
+    initial = _points_to_initial_drawing(
+        [(point["x"], point["y"]) for point in canvas_points],
+        r=8,
+        background_rgb=canvas_bg_rgb,
     )
 
     canvas = st_canvas(
         fill_color="rgba(180, 0, 255, 0.22)",
         stroke_width=3,
         stroke_color="rgba(180, 0, 255, 0.95)",
-        background_image=Image.fromarray(canvas_bg_rgb),
+        # Embed the aligned target directly in Fabric's drawing JSON. The
+        # component's background_image helper builds a media URL that is not
+        # reliable behind Streamlit Cloud's nested /~/+/ proxy.
+        background_color="#000000",
         update_streamlit=True,
         height=CANVAS_SIZE,
         width=CANVAS_SIZE,
