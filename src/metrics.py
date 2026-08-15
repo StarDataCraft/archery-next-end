@@ -26,6 +26,8 @@ def compute_metrics(
             "offset": {"dx": 0.0, "dy": 0.0, "mag": 0.0},
             "spread_ratio": None,
             "offset_ratio": None,
+            "anisotropy": 1.0,
+            "outlier": {"present": False, "index": None, "distance": 0.0, "core_spread": 0.0, "improvement_ratio": 0.0},
         }
 
     xy = np.array([[p["x"], p["y"]] for p in points], dtype=float)
@@ -38,6 +40,46 @@ def compute_metrics(
     # axis-wise dispersion
     sx = float(xy[:, 0].std(ddof=0))
     sy = float(xy[:, 1].std(ddof=0))
+    anisotropy = float(max(sx, sy) / max(min(sx, sy), 1e-6))
+
+    # A single escaped arrow should not be treated as a whole-group form
+    # pattern. Detect it conservatively with both a robust distance test and a
+    # meaningful improvement in the remaining core group's spread.
+    outlier = {
+        "present": False,
+        "index": None,
+        "distance": 0.0,
+        "core_spread": spread,
+        "improvement_ratio": 0.0,
+    }
+    if len(points) >= 5 and spread > 1e-6:
+        robust_center = np.median(xy, axis=0)
+        robust_distances = np.linalg.norm(xy - robust_center, axis=1)
+        candidate_index = int(np.argmax(robust_distances))
+        candidate_distance = float(robust_distances[candidate_index])
+        median_distance = float(np.median(robust_distances))
+        mad = float(np.median(np.abs(robust_distances - median_distance)))
+
+        core_xy = np.delete(xy, candidate_index, axis=0)
+        core_center = core_xy.mean(axis=0)
+        core_distances = np.linalg.norm(core_xy - core_center, axis=1)
+        core_spread = float(core_distances.mean())
+        improvement_ratio = float(max(0.0, (spread - core_spread) / spread))
+
+        robust_limit = median_distance + 3.0 * max(mad, 2.0)
+        relative_limit = max(20.0, median_distance * 1.9)
+        present = (
+            candidate_distance > robust_limit
+            and candidate_distance > relative_limit
+            and improvement_ratio >= 0.25
+        )
+        outlier = {
+            "present": bool(present),
+            "index": candidate_index if present else None,
+            "distance": candidate_distance,
+            "core_spread": core_spread if present else spread,
+            "improvement_ratio": improvement_ratio if present else 0.0,
+        }
 
     # Principal-axis direction. ``eigh`` is the correct solver for this real,
     # symmetric covariance matrix and always returns real eigenvectors. Some
@@ -77,6 +119,8 @@ def compute_metrics(
         "offset": {"dx": dx, "dy": dy, "mag": mag},
         "spread_ratio": spread_ratio,
         "offset_ratio": offset_ratio,
+        "anisotropy": anisotropy,
+        "outlier": outlier,
     }
 
 

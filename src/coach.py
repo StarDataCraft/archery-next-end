@@ -319,12 +319,36 @@ BOOK_CARDS: Dict[str, Dict[str, Any]] = {
 
 
 DIAGNOSIS_CANDIDATES = {
+    "single_outlier": ["feel_then_check", "finish_to_target", "focus_trigger"],
     "horizontal": ["string_vertical", "bow_hand_relaxed", "release_from_back"],
     "vertical": ["anchor_balance", "finish_to_target", "same_draw_path"],
     "loose": ["big_things_first", "body_alignment", "scoreless_groups"],
     "tight_offset": ["group_then_adjust", "feel_then_check", "focus_trigger"],
     "protect": ["feel_then_check", "quiet_mind", "focus_trigger", "finish_to_target"],
     "reference": ["anchor_balance", "same_draw_path", "bow_hand_relaxed", "body_alignment"],
+}
+
+
+SELF_REPORT_CARD = {
+    "bow_hand_tense": "bow_hand_relaxed",
+    "anchor_unclear": "anchor_balance",
+    "release_forced": "release_from_back",
+    "aim_too_long": "quiet_mind",
+    "bow_arm_dropped": "finish_to_target",
+    "fatigue_or_pain": "scoreless_groups",
+    "wind_or_equipment": "diary_experiment",
+}
+
+
+SELF_REPORT_LABELS = {
+    "none": {"ja": "特になし", "en": "Nothing specific", "zh": "没有明显感觉"},
+    "bow_hand_tense": {"ja": "弓手が力んだ", "en": "Bow hand felt tense", "zh": "弓手偏紧"},
+    "anchor_unclear": {"ja": "アンカーが曖昧", "en": "Anchor felt unclear", "zh": "锚点不清楚"},
+    "release_forced": {"ja": "離れを作った", "en": "Release felt forced", "zh": "撒放有主动用力"},
+    "aim_too_long": {"ja": "狙いが長すぎた", "en": "Aim lasted too long", "zh": "瞄准时间过长"},
+    "bow_arm_dropped": {"ja": "弓腕が落ちた", "en": "Bow arm dropped", "zh": "弓臂提前下落"},
+    "fatigue_or_pain": {"ja": "疲労または痛み", "en": "Fatigue or pain", "zh": "疲劳或疼痛"},
+    "wind_or_equipment": {"ja": "風または用具が気になった", "en": "Wind or equipment concern", "zh": "风或器材有影响"},
 }
 
 
@@ -339,6 +363,20 @@ def _ratio(metrics: Dict[str, Any], key: str, raw_key: str) -> float:
         return float(metrics.get(raw_key, 0.0) or 0.0) / 405.0
     except (TypeError, ValueError):
         return 0.0
+
+
+def _comparable_log(log: List[Dict[str, Any]], context: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not context:
+        return list(log or [])
+    distance = context.get("distance_m")
+    target_face = context.get("target_face")
+    return [
+        entry
+        for entry in (log or [])
+        if isinstance(entry, dict)
+        and (distance is None or entry.get("distance_m") == distance)
+        and (target_face is None or entry.get("target_face") == target_face)
+    ]
 
 
 def _last_metrics(log: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -362,6 +400,14 @@ def _recent_source_ids(log: List[Dict[str, Any]], limit: int = 4) -> List[str]:
         if len(ids) >= limit:
             break
     return ids
+
+
+def _last_advice(log: List[Dict[str, Any]]) -> Dict[str, Any]:
+    for entry in reversed(log or []):
+        advice = entry.get("advice") if isinstance(entry, dict) else None
+        if isinstance(advice, dict):
+            return advice
+    return {}
 
 
 def _recent_diagnoses(log: List[Dict[str, Any]], limit: int = 3) -> List[str]:
@@ -404,10 +450,21 @@ def _diagnose(metrics: Dict[str, Any], shape: str, scoring: Dict[str, Any]) -> D
     avg = float(scoring.get("avg", 0.0) or 0.0)
     sx = float(metrics.get("sx", 0.0) or 0.0)
     sy = float(metrics.get("sy", 0.0) or 0.0)
+    n = int(metrics.get("n", len(scoring.get("scores", []) or [])) or 6)
+    outlier = metrics.get("outlier", {}) or {}
+    spread = float(metrics.get("spread", 0.0) or 0.0)
+    core_spread = float(outlier.get("core_spread", spread) or 0.0)
+    # Preserve the target-size normalization already computed by metrics. The
+    # canonical target is currently 405 px, but coaching should not depend on
+    # that rendering detail.
+    core_spread_ratio = spread_ratio * (core_spread / spread) if spread > 1e-6 else 0.0
+    anisotropy = float(metrics.get("anisotropy", max(sx, sy) / max(min(sx, sy), 1e-6)) or 1.0)
 
     tight = spread_ratio <= 0.085
     loose = spread_ratio >= 0.135
-    if tight and offset_ratio >= 0.10:
+    if bool(outlier.get("present")):
+        key = "single_outlier"
+    elif tight and offset_ratio >= 0.10:
         key = "tight_offset"
     elif shape == "horizontal" and sx > sy * 1.35:
         key = "horizontal"
@@ -420,7 +477,21 @@ def _diagnose(metrics: Dict[str, Any], shape: str, scoring: Dict[str, Any]) -> D
     else:
         key = "reference"
 
-    return {"key": key, "spread_ratio": spread_ratio, "offset_ratio": offset_ratio, "spread": float(metrics.get("spread", 0.0) or 0.0), "dx": dx, "dy": dy, "sx": sx, "sy": sy, "avg": avg}
+    return {
+        "key": key,
+        "n": n,
+        "spread_ratio": spread_ratio,
+        "core_spread_ratio": core_spread_ratio,
+        "offset_ratio": offset_ratio,
+        "spread": spread,
+        "dx": dx,
+        "dy": dy,
+        "sx": sx,
+        "sy": sy,
+        "anisotropy": anisotropy,
+        "avg": avg,
+        "outlier": outlier,
+    }
 
 
 def _trend(lang: str, current: Dict[str, Any], previous: Optional[Dict[str, Any]]) -> Dict[str, str]:
@@ -439,12 +510,56 @@ def _trend(lang: str, current: Dict[str, Any], previous: Optional[Dict[str, Any]
     return {"key": "steady", "text": _text(lang, {"ja": "前回と広がりはほぼ同じ。同じ原因候補の別チェックへ進みます。", "en": "Spread is similar to the last saved end, so use a different check within the same issue.", "zh": "散布与上一组接近，因此在同一问题范围内换一个检查点。"})}
 
 
+def _previous_experiment(lang: str, diagnosis: Dict[str, Any], trend: Dict[str, str], log: List[Dict[str, Any]]) -> Dict[str, str]:
+    previous = _last_advice(log)
+    previous_diagnosis = previous.get("diagnosis", {}) if isinstance(previous, dict) else {}
+    if not previous or previous_diagnosis.get("key") != diagnosis["key"]:
+        return {}
+    status = trend["key"]
+    verdicts = {
+        "improving": {
+            "ja": "暫定的に有効",
+            "en": "Provisionally effective",
+            "zh": "暂定有效",
+        },
+        "steady": {
+            "ja": "明確な効果なし",
+            "en": "No clear effect yet",
+            "zh": "暂未显示明显效果",
+        },
+        "worse": {
+            "ja": "今回は支持されない",
+            "en": "Not supported by this end",
+            "zh": "本组结果暂不支持",
+        },
+    }
+    if status not in verdicts:
+        return {}
+    return {
+        "status": status,
+        "verdict": _text(lang, verdicts[status]),
+        "title": str(previous.get("title", "")),
+        "cue": str(previous.get("single_cue", previous.get("cue", ""))),
+        "detail": trend["text"],
+    }
+
+
 def _evidence(lang: str, diagnosis: Dict[str, Any]) -> str:
     key = diagnosis["key"]
     spread_pct = diagnosis["spread_ratio"] * 100
     offset_pct = diagnosis["offset_ratio"] * 100
     sx, sy = diagnosis["sx"], diagnosis["sy"]
     direction = _direction(lang, diagnosis["dx"], diagnosis["dy"])
+    if key == "single_outlier":
+        outlier = diagnosis["outlier"]
+        arrow_number = int(outlier.get("index", 0)) + 1
+        improvement = float(outlier.get("improvement_ratio", 0.0) or 0.0) * 100
+        core_pct = diagnosis["core_spread_ratio"] * 100
+        return _text(lang, {
+            "ja": f"第{arrow_number}射を外すと、残りのコア散布は外径の{core_pct:.1f}%で、広がりが{improvement:.0f}%縮みます。全体崩れではなく単発の外れ候補です。",
+            "en": f"Removing arrow {arrow_number} leaves a core spread of {core_pct:.1f}% of target radius and reduces spread by {improvement:.0f}%. This looks like one escaped shot, not a whole-group collapse.",
+            "zh": f"去掉第 {arrow_number} 箭后，核心散布为靶半径的 {core_pct:.1f}%，整体散布缩小 {improvement:.0f}%。更像单箭失误，而不是整组动作崩溃。",
+        })
     if key == "horizontal":
         multiple = sx / max(sy, 1e-6)
         return _text(lang, {"ja": f"横方向のばらつきは縦の{multiple:.1f}倍（sx {sx:.1f} / sy {sy:.1f}px）。", "en": f"Horizontal variation is {multiple:.1f}× vertical variation (sx {sx:.1f} / sy {sy:.1f}px).", "zh": f"横向波动是纵向的 {multiple:.1f} 倍（sx {sx:.1f} / sy {sy:.1f}px）。"})
@@ -460,6 +575,130 @@ def _evidence(lang: str, diagnosis: Dict[str, Any]) -> str:
     return _text(lang, {"ja": f"広がりは外径の{spread_pct:.1f}%で、強い一方向性はありません。基準の再現性を確認します。", "en": f"Spread is {spread_pct:.1f}% of target radius without one dominant axis; check repeatable references.", "zh": f"散布为靶半径的 {spread_pct:.1f}%，没有明显单一方向；应检查参考点的重复性。"})
 
 
+def _alternative_hypotheses(lang: str, diagnosis: Dict[str, Any]) -> List[str]:
+    values = {
+        "single_outlier": {
+            "ja": ["その1射だけフォローが早く終わった", "着弾点のマーキング誤差", "突風や用具の一時的な影響"],
+            "en": ["Follow-through ended early on that shot", "Hit-point marking error", "A brief wind or equipment disturbance"],
+            "zh": ["那一箭随动提前结束", "命中点标记误差", "短时风力或器材扰动"],
+        },
+        "horizontal": {
+            "ja": ["弦の縦方向または弦手のトルク", "弓手の圧が左右に変化", "横風またはサイト設定"],
+            "en": ["String verticality or draw-hand torque", "Changing bow-hand pressure", "Crosswind or sight setting"],
+            "zh": ["弦线竖直或拉弦手扭转", "弓手压力左右变化", "侧风或瞄具设置"],
+        },
+        "vertical": {
+            "ja": ["アンカー高さまたは引き経路", "弓腕が早く落ちる", "照明・サイト高さ・ノッキング点"],
+            "en": ["Anchor height or draw path", "Bow arm dropping early", "Light, sight height or nocking point"],
+            "zh": ["锚点高度或开弓路径", "弓臂提前下落", "光线、瞄具高度或搭箭点"],
+        },
+        "loose": {
+            "ja": ["疲労またはテンポの崩れ", "姿勢・肩・弓手など土台の変化", "画像補正または点の確認誤差"],
+            "en": ["Fatigue or tempo drift", "Foundation changes in stance, shoulder or bow hand", "Image alignment or point-confirmation error"],
+            "zh": ["疲劳或节奏漂移", "站姿、肩膀或弓手等基础变化", "图像校正或点位确认误差"],
+        },
+        "tight_offset": {
+            "ja": ["サイト値または狙点", "一定方向の風", "的補正の中心ずれ"],
+            "en": ["Sight mark or aiming reference", "Steady wind", "A small error in target-centre alignment"],
+            "zh": ["瞄具刻度或瞄准参考", "稳定方向的风", "靶心校正存在小偏差"],
+        },
+        "protect": {
+            "ja": ["技術問題ではなく通常の標本変動", "良い射を意識で操作し始めた", "点を早く見ようとした"],
+            "en": ["Normal sample variation rather than a technical fault", "Conscious control entering an already good shot", "Looking for the result too early"],
+            "zh": ["只是正常样本波动，并非技术故障", "意识开始干预原本良好的动作", "过早寻找落点"],
+        },
+        "reference": {
+            "ja": ["アンカーまたは弦像の基準", "身体アライメント", "集中開始点の不一致"],
+            "en": ["Anchor or string-picture reference", "Body alignment", "Inconsistent focus trigger"],
+            "zh": ["锚点或弦像参考", "身体对齐", "专注启动点不一致"],
+        },
+    }
+    return list(values[diagnosis["key"]].get(lang, values[diagnosis["key"]]["en"]))
+
+
+def _success_criterion(lang: str, diagnosis: Dict[str, Any]) -> str:
+    key = diagnosis["key"]
+    if key == "single_outlier":
+        return _text(lang, {
+            "ja": "次の6射で5射以上を○にし、単独でコア半径の2倍以上離れる矢を0本にする。",
+            "en": "Grade at least five of six shots as pass, with no arrow landing more than 2× the core radius alone.",
+            "zh": "下一组至少 5/6 箭动作通过，并且没有单箭独自偏离核心半径 2 倍以上。",
+        })
+    if key in {"horizontal", "vertical"}:
+        ratio = diagnosis["anisotropy"]
+        axis = _text(lang, {"ja": "横/縦比" if key == "horizontal" else "縦/横比", "en": "horizontal/vertical ratio" if key == "horizontal" else "vertical/horizontal ratio", "zh": "横纵比" if key == "horizontal" else "纵横比"})
+        return _text(lang, {
+            "ja": f"次の6射で{axis}を現在の{ratio:.1f}から15%以上下げるか、1.5以下にする。平均点は0.5点以上落とさない。",
+            "en": f"On the next six arrows, reduce the {axis} by at least 15% from {ratio:.1f}, or bring it to 1.5 or less, without losing more than 0.5 average points.",
+            "zh": f"下一组把{axis}从当前 {ratio:.1f} 降低至少 15%，或降到 1.5 以下；平均分下降不超过 0.5。",
+        })
+    if key == "loose":
+        current = diagnosis["core_spread_ratio"] * 100
+        target = current * 0.85
+        return _text(lang, {
+            "ja": f"次の6射でコア散布を外径の{current:.1f}%から{target:.1f}%以下へ縮め、5射以上を同じ終了姿勢にする。",
+            "en": f"Reduce core spread from {current:.1f}% to {target:.1f}% of target radius or less, with at least five matching finishes.",
+            "zh": f"下一组把核心散布从靶半径的 {current:.1f}% 降到 {target:.1f}% 以下，并至少有 5 箭结束姿势一致。",
+        })
+    if key == "tight_offset":
+        offset = diagnosis["offset_ratio"] * 100
+        target = offset * 0.8
+        spread_limit = diagnosis["spread_ratio"] * 110
+        return _text(lang, {
+            "ja": f"中心ずれを{offset:.1f}%から{target:.1f}%以下へ減らし、広がりは{spread_limit:.1f}%以内に保つ。",
+            "en": f"Reduce offset from {offset:.1f}% to {target:.1f}% of target radius or less while keeping spread at {spread_limit:.1f}% or less.",
+            "zh": f"把中心偏移从靶半径的 {offset:.1f}% 降到 {target:.1f}% 以下，同时散布保持在 {spread_limit:.1f}% 以下。",
+        })
+    if key == "protect":
+        limit = diagnosis["spread_ratio"] * 110
+        return _text(lang, {
+            "ja": f"6射中5射以上で同じ合図を守り、広がりを外径の{limit:.1f}%以内に保つ。",
+            "en": f"Keep the cue on at least five of six shots and hold spread within {limit:.1f}% of target radius.",
+            "zh": f"至少 5/6 箭守住同一口令，并把散布维持在靶半径的 {limit:.1f}% 以内。",
+        })
+    target = diagnosis["spread_ratio"] * 90
+    return _text(lang, {
+        "ja": f"6射中5射以上で基準を再現し、広がりを外径の{target:.1f}%以下へ縮める。",
+        "en": f"Repeat the reference on at least five of six shots and reduce spread to {target:.1f}% of target radius or less.",
+        "zh": f"至少 5/6 箭重复同一参考点，并把散布降到靶半径的 {target:.1f}% 以下。",
+    })
+
+
+def _do_not_change(lang: str, diagnosis: Dict[str, Any]) -> str:
+    key = diagnosis["key"]
+    values = {
+        "single_outlier": {"ja": "1本の外れだけでサイトやフォーム全体を変えない。", "en": "Do not change sight or the whole form because of one escaped arrow.", "zh": "不要因为一支异常箭就调整瞄具或整套动作。"},
+        "tight_offset": {"ja": "サイトとフォームを同時に変えない。", "en": "Do not change the sight and form at the same time.", "zh": "不要同时修改瞄具和动作。"},
+        "protect": {"ja": "良いグループに新しい技術課題を足さない。", "en": "Do not add a new technical task to an already good group.", "zh": "不要给已经不错的箭群再增加新技术课题。"},
+    }
+    return _text(lang, values.get(key, {"ja": "このエンドでは他の技術項目を同時に変えない。", "en": "Do not change another technical variable during this end.", "zh": "这一组不要同时改动其他技术变量。"}))
+
+
+def _confidence(lang: str, diagnosis: Dict[str, Any], quality: Optional[Dict[str, Any]], repeated: bool, self_report: str) -> Dict[str, str]:
+    quality_score = float((quality or {}).get("score", 0.75) or 0.0)
+    n = diagnosis["n"]
+    strong_pattern = diagnosis["key"] == "single_outlier" or diagnosis["anisotropy"] >= 1.8 or diagnosis["offset_ratio"] >= 0.14
+    if quality_score < 0.55 or n < 5:
+        level = "low"
+    elif repeated and (strong_pattern or self_report != "none"):
+        level = "high"
+    elif strong_pattern or self_report != "none":
+        level = "medium"
+    else:
+        level = "low"
+    labels = {
+        "low": {"ja": "低", "en": "Low", "zh": "低"},
+        "medium": {"ja": "中", "en": "Medium", "zh": "中"},
+        "high": {"ja": "高", "en": "High", "zh": "高"},
+    }
+    reasons = {
+        "low": {"ja": "少数矢または画像/形状の不確実性があるため、原因は仮説です。", "en": "The cause remains a hypothesis because of sample size or image/shape uncertainty.", "zh": "由于箭数较少或图像/形状存在不确定性，原因仍只是待验证假设。"},
+        "medium": {"ja": "形状の傾向は明確ですが、1エンドだけでは原因を断定しません。", "en": "The pattern is clear, but one end is not enough to prove the cause.", "zh": "形状趋势较明确，但单独一组仍不足以证明具体原因。"},
+        "high": {"ja": "同条件の履歴でも傾向が反復しています。それでも単一テストで確認します。", "en": "The pattern repeats in comparable saved ends; still verify it with one controlled test.", "zh": "相同条件的历史记录中也重复出现该趋势，但仍需用单变量测试确认。"},
+    }
+    return {"level": level, "label": _text(lang, labels[level]), "reason": _text(lang, reasons[level])}
+
+
 def _profile_boosts(profile: Dict[str, Any]) -> Dict[str, float]:
     profile_text = " ".join(str(profile.get(k, "")) for k in ("goals", "recurring_issues", "constraints")).lower()
     groups = {
@@ -473,7 +712,13 @@ def _profile_boosts(profile: Dict[str, Any]) -> Dict[str, float]:
     return {card_id: 3.0 for card_id, words in groups.items() if any(word in profile_text for word in words)}
 
 
-def _pick_card(diagnosis: Dict[str, Any], profile: Dict[str, Any], log: List[Dict[str, Any]], trend: Dict[str, str]) -> str:
+def _pick_card(
+    diagnosis: Dict[str, Any],
+    profile: Dict[str, Any],
+    log: List[Dict[str, Any]],
+    trend: Dict[str, str],
+    self_report: str,
+) -> str:
     key = str(diagnosis["key"])
     candidates = list(DIAGNOSIS_CANDIDATES[key])
     recent_diagnoses = _recent_diagnoses(log)
@@ -483,6 +728,17 @@ def _pick_card(diagnosis: Dict[str, Any], profile: Dict[str, Any], log: List[Dic
         candidates.insert(0, "finish_to_target")
     if trend["key"] == "worse" and key in {"loose", "reference"}:
         candidates.insert(0, "scoreless_groups")
+    reported_card = SELF_REPORT_CARD.get(self_report)
+    if reported_card:
+        # A direct shot-feel report is stronger evidence about the movement
+        # than geometry alone, so use it as the first controlled test.
+        candidates.insert(0, reported_card)
+    elif trend["key"] == "improving" and recent_diagnoses and recent_diagnoses[0] == key:
+        # If the controlled check improved the same pattern, repeat it once
+        # instead of changing the technical cue immediately.
+        recent_sources = _recent_source_ids(log, limit=1)
+        if recent_sources and recent_sources[0] in BOOK_CARDS:
+            return recent_sources[0]
 
     boosts = _profile_boosts(profile)
     recent_sources = _recent_source_ids(log)
@@ -537,13 +793,19 @@ class CoachRAG:
         user_profile: Dict[str, Any],
         log: List[Dict[str, Any]],
         quality: Optional[Dict[str, Any]] = None,
+        self_report: str = "none",
+        session_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if self.cfg.mode == "rules":
             return dict(base_advice)
 
+        comparable_log = _comparable_log(log, session_context)
         diagnosis = _diagnose(metrics, shape, scoring)
-        trend = _trend(lang, diagnosis, _last_metrics(log))
-        card_id = _pick_card(diagnosis, user_profile or {}, log or [], trend)
+        recent_diagnoses = _recent_diagnoses(comparable_log)
+        repeated = bool(recent_diagnoses and recent_diagnoses[0] == diagnosis["key"])
+        trend = _trend(lang, diagnosis, _last_metrics(comparable_log))
+        previous_experiment = _previous_experiment(lang, diagnosis, trend, comparable_log)
+        card_id = _pick_card(diagnosis, user_profile or {}, comparable_log, trend, self_report)
 
         bow = str((user_profile or {}).get("bow", "recurve")).lower()
         if card_id == "group_then_adjust" and bow == "barebow":
@@ -555,6 +817,8 @@ class CoachRAG:
         fallback = _text(lang, card["fallback"])
         drill_name = _text(lang, card["drill_name"])
         source = _localized_source(card, lang, self.cfg.pdf_path)
+        confidence = _confidence(lang, diagnosis, quality, repeated, self_report)
+        self_report_label = _text(lang, SELF_REPORT_LABELS.get(self_report, SELF_REPORT_LABELS["none"]))
 
         out = dict(base_advice)
         out.update({
@@ -569,12 +833,29 @@ class CoachRAG:
             "stage": card["stage"],
             "tag": card_id,
             "script": _script(lang, cue, pass_fail, fallback, drill_name),
-            "diagnosis": {"key": diagnosis["key"], "evidence": _evidence(lang, diagnosis), "trend": trend["text"], "trend_key": trend["key"], "handedness_context": _handedness_context(lang, handedness), "confidence": "medium"},
+            "diagnosis": {
+                "key": diagnosis["key"],
+                "evidence": _evidence(lang, diagnosis),
+                "trend": trend["text"],
+                "trend_key": trend["key"],
+                "handedness_context": _handedness_context(lang, handedness),
+                "confidence": confidence["level"],
+                "confidence_label": confidence["label"],
+                "confidence_reason": confidence["reason"],
+                "self_report": self_report,
+                "self_report_label": self_report_label,
+            },
+            "feedback": {
+                "success_criterion": _success_criterion(lang, diagnosis),
+                "alternative_hypotheses": _alternative_hypotheses(lang, diagnosis),
+                "do_not_change": _do_not_change(lang, diagnosis),
+                "selected_by": "self_report" if self_report in SELF_REPORT_CARD else "group_pattern",
+                "previous_experiment": previous_experiment,
+            },
             "book_source": source,
             "book_sources": [source],
-            "rag": {"engine": "reviewed_book_cards", "source_id": card_id, "diagnosis": diagnosis["key"], "history_used": bool(log)},
+            "rag": {"engine": "reviewed_book_cards", "source_id": card_id, "diagnosis": diagnosis["key"], "history_used": bool(comparable_log)},
         })
         if quality is not None and float(quality.get("score", 1.0) or 0.0) < 0.55:
-            out["diagnosis"]["confidence"] = "low"
             out["diagnosis"]["evidence"] += _text(lang, {"ja": " 画像補正の信頼度が低いため、原因は仮説として扱ってください。", "en": " Image alignment confidence is low, so treat the cause as a hypothesis.", "zh": " 图像校正可信度较低，因此请把原因视为待验证假设。"})
         return out

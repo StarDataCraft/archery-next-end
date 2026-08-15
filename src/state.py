@@ -24,6 +24,10 @@ DEFAULTS = {
     # last result: metrics + scoring + advice
     "last_result": None,
 
+    # Optional shot-feel observation for the current end. Geometry can show a
+    # pattern, but the archer's own observation is needed to test a cause.
+    "end_self_report": "none",
+
     # history
     "log": [],
 
@@ -71,6 +75,7 @@ def init_state():
 def reset_shot():
     st.session_state.points = []
     st.session_state.last_result = None
+    st.session_state.end_self_report = "none"
 
 
 def reset_cv_cache():

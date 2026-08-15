@@ -47,6 +47,25 @@ class CanvasPointTests(unittest.TestCase):
         self.assertAlmostEqual(points[0]["x"], 450.0)
         self.assertAlmostEqual(points[0]["y"], 225.0)
 
+    def test_stale_smaller_canvas_payload_does_not_drop_a_confirmed_point(self):
+        current = [
+            {"x": 100.0 + index, "y": 200.0 + index}
+            for index in range(6)
+        ]
+        stale_payload = {
+            "objects": [
+                {
+                    "type": "circle",
+                    "left": 70.0 + index,
+                    "top": 150.0 + index,
+                    "radius": 8.0,
+                }
+                for index in range(5)
+            ]
+        }
+
+        self.assertEqual(_update_points_from_canvas(current, stale_payload), current)
+
     def test_fabric_circle_scale_is_included_in_center(self):
         payload = {
             "objects": [

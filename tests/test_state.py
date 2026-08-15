@@ -19,6 +19,7 @@ class SessionStateTests(unittest.TestCase):
         self.assertEqual(second_session["log"], [])
         self.assertEqual(second_session["user_profile"]["name"], "")
         self.assertEqual(second_session["coach_mode"], "book")
+        self.assertEqual(second_session["end_self_report"], "none")
 
     def test_old_rules_session_migrates_to_book_once(self):
         old_session = {"coach_mode": "rules"}

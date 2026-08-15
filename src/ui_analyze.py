@@ -30,6 +30,17 @@ MAX_IMAGE_DIMENSION = 2400
 
 logger = logging.getLogger(__name__)
 
+SELF_REPORT_OPTIONS = [
+    "none",
+    "bow_hand_tense",
+    "anchor_unclear",
+    "release_forced",
+    "aim_too_long",
+    "bow_arm_dropped",
+    "fatigue_or_pain",
+    "wind_or_equipment",
+]
+
 
 def _bgr_to_rgb_uint8(bgr: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.uint8)
@@ -101,6 +112,12 @@ def _update_points_from_canvas(current_points: list[dict], json_data: dict | Non
     """Persist canonical points across Streamlit's transient component reruns."""
     canvas_points = _extract_points_from_canvas(json_data)
     if not canvas_points:
+        return list(current_points)
+    # The drawable-canvas component can briefly emit its previous payload when
+    # another Streamlit widget opens or changes. The toolbar has no delete
+    # action in this app, so a smaller payload is stale rather than intentional.
+    # Point removal is handled explicitly by the Clear button.
+    if len(canvas_points) < len(current_points):
         return list(current_points)
     canonical = _scale_points(canvas_points, CANON_SIZE / CANVAS_SIZE)
     return _sanitize_canonical_points(canonical)
@@ -338,6 +355,7 @@ def render_analyze_step():
             st.session_state.auto_points = auto_pts_canon
             st.session_state.points = _sanitize_canonical_points(auto_pts_canon[:need])
             st.session_state.last_result = None
+            st.session_state.end_self_report = "none"
             st.session_state.canvas_revision += 1
 
             st.session_state._geom_center = CANON_CENTER
@@ -364,7 +382,7 @@ def render_analyze_step():
     quality = st.session_state.get("cv_quality", None)
 
     with st.expander(t("source_preview", lang), expanded=False):
-        st.image(img_rgb, caption=t("source_photo", lang), width=CANVAS_SIZE)
+        st.image(img_rgb, caption=t("source_photo", lang), use_container_width=True)
 
     st.subheader(t("tap_points", lang))
     st.caption(t("mapped_target_hint", lang))
@@ -372,7 +390,7 @@ def render_analyze_step():
         st.warning(t("quality_warning", lang))
     if not auto_pts:
         st.info(t("manual_points", lang))
-    with st.expander("CV debug"):
+    with st.expander(t("metric_debug", lang)):
         st.write(st.session_state.warp_debug)
         if quality is not None:
             st.write({"quality": quality})
@@ -411,6 +429,19 @@ def render_analyze_step():
     points = _update_points_from_canvas(canonical_points, canvas.json_data)
     st.session_state.points = points
     st.write(t("marked", lang).format(count=len(points), need=need))
+
+    with st.expander(t("end_self_report", lang), expanded=False):
+        st.caption(t("end_self_report_help", lang))
+        current_report = st.session_state.end_self_report
+        if current_report not in SELF_REPORT_OPTIONS:
+            current_report = "none"
+        st.session_state.end_self_report = st.selectbox(
+            t("end_self_report", lang),
+            options=SELF_REPORT_OPTIONS,
+            index=SELF_REPORT_OPTIONS.index(current_report),
+            format_func=lambda key: t(f"self_{key}", lang),
+            label_visibility="collapsed",
+        )
 
     col1, col2 = st.columns([1, 1])
     with col1:
@@ -472,6 +503,11 @@ def render_analyze_step():
                     user_profile=st.session_state.user_profile,
                     log=st.session_state.log,
                     quality=quality,
+                    self_report=st.session_state.end_self_report,
+                    session_context={
+                        "distance_m": int(st.session_state.distance_m),
+                        "target_face": st.session_state.target_face,
+                    },
                 )
             except Exception as exc:
                 advice = dict(base_advice)
@@ -510,21 +546,29 @@ def render_analyze_step():
 
         st.divider()
         st.subheader(t("result_overlay", lang))
-        st.image(res["overlay_hits_rgb"], width=CANVAS_SIZE)
+        image_col, _ = st.columns([7, 4])
+        with image_col:
+            st.image(res["overlay_hits_rgb"], use_container_width=True)
 
         st.subheader(t("result_score", lang))
-        st.write(f"- Total: **{scoring['total']}** / {need * 10}")
-        st.write(f"- Avg: **{scoring['avg']:.2f}**")
-        st.write(f"- Per arrow: {scoring['scores']}")
-
-        with st.expander("Per-arrow debug (radial vs color band)"):
-            st.write(res.get("color_debug", []))
+        score_col1, score_col2 = st.columns(2)
+        score_col1.metric(t("metric_total", lang), f"{scoring['total']} / {need * 10}")
+        score_col2.metric(t("metric_average", lang), f"{scoring['avg']:.2f}")
+        st.caption(f"{t('metric_per_arrow', lang)}: {scoring['scores']}")
 
         st.subheader(t("result_metrics", lang))
-        st.write(f"- Shape: **{res['shape']}**")
-        st.write(f"- Spread (avg): **{metrics['spread']:.1f} px**")
-        st.write(f"- Direction: **{metrics['slope_deg']:.0f}°**")
-        st.write(f"- Offset dx/dy: **{offset.get('dx', 0.0):.1f} / {offset.get('dy', 0.0):.1f} px**")
+        spread_pct = float(metrics.get("spread_ratio") or 0.0) * 100
+        offset_pct = float(metrics.get("offset_ratio") or 0.0) * 100
+        outlier = metrics.get("outlier", {}) or {}
+        shape_label = t(f"shape_{res['shape']}", lang)
+        st.write(f"- {t('metric_shape', lang)}: **{shape_label}**")
+        st.write(f"- {t('metric_spread', lang)}: **{spread_pct:.1f}%**")
+        st.write(f"- {t('metric_direction', lang)}: **{metrics['slope_deg']:.0f}°**")
+        st.write(f"- {t('metric_offset', lang)}: **{offset_pct:.1f}%**")
+        if outlier.get("present"):
+            arrow_label = t("metric_arrow_number", lang).format(number=int(outlier["index"]) + 1)
+            core_spread_pct = spread_pct * float(outlier.get("core_spread", 0.0) or 0.0) / max(float(metrics.get("spread", 0.0) or 0.0), 1e-6)
+            st.warning(f"{t('metric_outlier', lang)}: **{arrow_label}** · {t('metric_core_spread', lang)} {core_spread_pct:.1f}%")
 
         st.subheader(t("coach_next", lang))
         st.markdown(f"**{advice.get('title', '')}**")
@@ -536,21 +580,20 @@ def render_analyze_step():
         script = advice.get("script", "")
 
         diagnosis = advice.get("diagnosis", {}) or {}
+        feedback = advice.get("feedback", {}) or {}
         if diagnosis:
-            st.markdown(f"**{t('coach_evidence', lang)}**: {diagnosis.get('evidence', '')}")
-            st.caption(f"{t('coach_handedness', lang)}: {diagnosis.get('handedness_context', '')}")
-            st.caption(f"{t('coach_trend', lang)}: {diagnosis.get('trend', '')}")
-
-        why = advice.get("why", "")
-        if why:
-            st.markdown(f"**{t('coach_why', lang)}**: {why}")
+            confidence = diagnosis.get("confidence_label", diagnosis.get("confidence", ""))
+            confidence_reason = diagnosis.get("confidence_reason", "")
+            st.info(
+                f"**{t('coach_evidence', lang)}**: {diagnosis.get('evidence', '')}\n\n"
+                f"**{t('coach_confidence', lang)}**: {confidence} — {confidence_reason}"
+            )
 
         if single_cue:
             st.markdown(f"**{t('coach_one_cue', lang)}**: {single_cue}")
-        if pass_fail:
-            st.markdown(f"**{t('coach_pass_fail', lang)}**: {pass_fail}")
-        if fallback:
-            st.markdown(f"**{t('coach_fallback', lang)}**: {fallback}")
+        success = feedback.get("success_criterion", "")
+        if success:
+            st.success(f"**{t('coach_success', lang)}**: {success}")
 
         drill = advice.get("drill", {}) or {}
         if isinstance(drill, dict) and drill:
@@ -562,16 +605,45 @@ def render_analyze_step():
             if how:
                 st.markdown(how)
 
-        if mental:
-            st.markdown(f"**{t('coach_mental', lang)}**: {mental}")
+        if fallback:
+            st.markdown(f"**{t('coach_fallback', lang)}**: {fallback}")
+
+        with st.expander(t("coach_reasoning", lang), expanded=False):
+            previous_experiment = feedback.get("previous_experiment", {}) or {}
+            if previous_experiment:
+                st.markdown(
+                    f"**{t('coach_previous_test', lang)}**: "
+                    f"{previous_experiment.get('verdict', '')} — {previous_experiment.get('title', '')}"
+                )
+                st.caption(previous_experiment.get("detail", ""))
+            why = advice.get("why", "")
+            if why:
+                st.markdown(f"**{t('coach_why', lang)}**: {why}")
+            if diagnosis.get("self_report") not in {None, "none"}:
+                st.markdown(f"**{t('coach_self_report', lang)}**: {diagnosis.get('self_report_label', '')}")
+            alternatives = feedback.get("alternative_hypotheses", []) or []
+            if alternatives:
+                st.markdown(f"**{t('coach_alternatives', lang)}**")
+                for alternative in alternatives:
+                    st.write(f"- {alternative}")
+            do_not_change = feedback.get("do_not_change", "")
+            if do_not_change:
+                st.markdown(f"**{t('coach_do_not_change', lang)}**: {do_not_change}")
+            if pass_fail:
+                st.markdown(f"**{t('coach_pass_fail', lang)}**: {pass_fail}")
+            if diagnosis:
+                st.caption(f"{t('coach_trend', lang)}: {diagnosis.get('trend', '')}")
+                st.caption(f"{t('coach_handedness', lang)}: {diagnosis.get('handedness_context', '')}")
+            if mental:
+                st.markdown(f"**{t('coach_mental', lang)}**: {mental}")
 
         if script:
-            with st.expander(t("coach_script", lang)):
+            with st.expander(t("coach_script", lang), expanded=False):
                 st.code(script, language="text")
 
         source = advice.get("book_source", {}) or {}
         if source:
-            with st.expander(t("coach_source", lang), expanded=True):
+            with st.expander(t("coach_source", lang), expanded=False):
                 st.markdown(f"**{source.get('title', '')}**")
                 st.write(source.get("chapter", ""))
                 st.write(f"{t('coach_pdf_pages', lang)}: {source.get('pdf_pages', '')}")
@@ -580,14 +652,21 @@ def render_analyze_step():
         with st.expander(t("coach_details", lang)):
             if "rag_error" in advice:
                 st.warning(advice["rag_error"])
-            st.write({"diagnosis": diagnosis, "source": source})
+            st.write({
+                "shape": res["shape"],
+                "spread_px": metrics.get("spread"),
+                "offset_px": offset,
+                "diagnosis": diagnosis,
+                "source": source,
+                "scoring_details": res.get("color_debug", []),
+            })
 
     # -------------------------
     # Save log
     # -------------------------
     if save_clicked:
         if not st.session_state.last_result:
-            st.warning("Analyze first.")
+            st.warning(t("analyze_first", lang))
             return
 
         entry = make_log_entry(
@@ -600,14 +679,14 @@ def render_analyze_step():
             advice=st.session_state.last_result["advice"],
         )
         st.session_state.log.append(entry)
-        st.success("Saved.")
+        st.success(t("saved", lang))
 
     if st.session_state.log:
         st.divider()
-        st.subheader("Log")
+        st.subheader(t("log", lang))
         json_text = export_log_json(st.session_state.log)
         st.download_button(
-            label="Download log.json",
+            label=t("download_log", lang),
             data=json_text.encode("utf-8"),
             file_name="log.json",
             mime="application/json",
