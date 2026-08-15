@@ -6,6 +6,8 @@ from typing import List, Tuple, Dict, Optional
 import numpy as np
 import cv2
 
+from .cv_utils import normalize_hough_circles, normalize_hough_lines
+
 
 @dataclass
 class TargetRectifyResult:
@@ -109,13 +111,14 @@ def _refine_circle(bgr: np.ndarray) -> Tuple[Tuple[float, float], float, Dict[st
         maxRadius=int(min(h, w) * 0.49),
     )
 
+    detected_circles = normalize_hough_circles(circles)
     dbg: Dict[str, object] = {"circle_found": False}
-    if circles is None:
+    if len(detected_circles) == 0:
         return (w / 2.0, h / 2.0), min(w, h) * 0.45, {"circle_found": False, "fallback": "no_hough"}
 
-    circles = np.round(circles[0, :]).astype(int)
-    circles = sorted(circles, key=lambda c: c[2], reverse=True)
-    x, y, r = circles[0]
+    detected_circles = np.round(detected_circles).astype(int)
+    detected_circles = sorted(detected_circles, key=lambda c: c[2], reverse=True)
+    x, y, r = detected_circles[0]
     dbg.update({"circle_found": True, "circle_xy_r": (int(x), int(y), int(r))})
     return (float(x), float(y)), float(r), dbg
 
@@ -159,11 +162,12 @@ def _detect_arrow_present(bgr: np.ndarray) -> Tuple[bool, int]:
         minLineLength=int(min(h, w) * 0.18),
         maxLineGap=12,
     )
-    if lines is None:
+    segments = normalize_hough_lines(lines)
+    if len(segments) == 0:
         return False, 0
 
     cnt = 0
-    for (x1, y1, x2, y2) in lines[:, 0, :]:
+    for x1, y1, x2, y2 in segments:
         length = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
         if length >= min(h, w) * 0.22:
             cnt += 1
@@ -263,12 +267,13 @@ def _detect_x_center(
         minLineLength=max(12, int(min(roi.shape[:2]) * 0.15)),
         maxLineGap=6,
     )
-    if lines is None or len(lines) < 2:
+    segments = normalize_hough_lines(lines)
+    if len(segments) < 2:
         dbg["fallback"] = "no_lines"
         return None, dbg
 
     segs = []
-    for (xA, yA, xB, yB) in lines[:, 0, :]:
+    for xA, yA, xB, yB in segments:
         dx, dy = float(xB - xA), float(yB - yA)
         L = (dx * dx + dy * dy) ** 0.5
         if L < 10:
@@ -594,8 +599,9 @@ def propose_hit_points(
             minLineLength=int(min(h, w) * 0.18),
             maxLineGap=12,
         )
-        if lines is not None:
-            for (x1, y1, x2, y2) in lines[:, 0, :]:
+        segments = normalize_hough_lines(lines)
+        if len(segments):
+            for x1, y1, x2, y2 in segments:
                 d1 = (x1 - cx) ** 2 + (y1 - cy) ** 2
                 d2 = (x2 - cx) ** 2 + (y2 - cy) ** 2
                 if d1 <= d2:

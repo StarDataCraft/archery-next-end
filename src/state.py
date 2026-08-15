@@ -1,4 +1,6 @@
 # src/state.py
+from copy import deepcopy
+
 import streamlit as st
 
 DEFAULTS = {
@@ -54,7 +56,9 @@ DEFAULTS = {
 def init_state():
     for k, v in DEFAULTS.items():
         if k not in st.session_state:
-            st.session_state[k] = v
+            # Lists and profile dictionaries must not be shared by concurrent
+            # Streamlit sessions.
+            st.session_state[k] = deepcopy(v)
 
 
 def reset_shot():
@@ -68,6 +72,11 @@ def reset_cv_cache():
     st.session_state.overlay_image_rgb = None
     st.session_state.auto_points = None
     st.session_state.warp_debug = None
+    st.session_state.cv_quality = None
+    st.session_state._geom_center = None
+    st.session_state._geom_outer = None
+    st.session_state._rect_photo_bgr = None
+    st.session_state._M_rect_to_canon = None
 
 
 def goto_step(step: str):

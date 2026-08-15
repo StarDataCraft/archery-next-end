@@ -6,10 +6,11 @@ def render_language_step():
     st.title(t("choose_language", st.session_state.language))
 
     lang = st.radio(
-        label="",
+        label=t("choose_language", st.session_state.language),
         options=["ja", "en", "zh"],
         format_func=lambda x: {"ja": "日本語", "en": "English", "zh": "中文"}[x],
         index=["ja", "en", "zh"].index(st.session_state.language),
+        label_visibility="collapsed",
     )
     st.session_state.language = lang
 

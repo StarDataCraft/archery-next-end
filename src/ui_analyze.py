@@ -1,8 +1,11 @@
 # src/ui_analyze.py
 from __future__ import annotations
 
+import hashlib
+import logging
+
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageOps, UnidentifiedImageError
 import numpy as np
 import cv2
 from streamlit_drawable_canvas import st_canvas
@@ -21,6 +24,10 @@ from .coach import CoachRAG, CoachConfig
 CANON_SIZE = 900
 CANON_CENTER = (CANON_SIZE / 2.0, CANON_SIZE / 2.0)
 CANON_OUTER = CANON_SIZE * 0.45  # 405 px
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_IMAGE_DIMENSION = 2400
+
+logger = logging.getLogger(__name__)
 
 
 def _bgr_to_rgb_uint8(bgr: np.ndarray) -> np.ndarray:
@@ -111,22 +118,45 @@ def _read_image_from_uploader_or_camera() -> tuple[np.ndarray | None, str | None
 
     if st.session_state.image_mode == "upload":
         st.subheader(t("upload", lang))
-        file = st.file_uploader("", type=["png", "jpg", "jpeg"])
+        file = st.file_uploader(
+            t("upload", lang),
+            type=["png", "jpg", "jpeg"],
+            label_visibility="collapsed",
+        )
         if not file:
             return None, None
-        img_pil = Image.open(file).convert("RGB")
-        img_rgb = np.array(img_pil, dtype=np.uint8)
-        cache_key = f"upload-{getattr(file, 'name', 'file')}-{img_rgb.shape[0]}x{img_rgb.shape[1]}"
-        return img_rgb, cache_key
+        if getattr(file, "size", 0) > MAX_UPLOAD_BYTES:
+            st.error(t("image_too_large", lang))
+            return None, "error"
+        return _decode_image(file, source="upload", lang=lang)
 
     # camera mode
     st.subheader(t("camera", lang))
-    cam = st.camera_input("")
+    cam = st.camera_input(t("camera", lang), label_visibility="collapsed")
     if not cam:
         return None, None
-    img_pil = Image.open(cam).convert("RGB")
-    img_rgb = np.array(img_pil, dtype=np.uint8)
-    cache_key = f"camera-{int(cam.size)}-{img_rgb.shape[0]}x{img_rgb.shape[1]}"
+    return _decode_image(cam, source="camera", lang=lang)
+
+
+def _decode_image(file, source: str, lang: str) -> tuple[np.ndarray | None, str | None]:
+    """Decode, orient, and bound an uploaded image before running OpenCV."""
+    try:
+        image = Image.open(file)
+        image.load()
+        image = ImageOps.exif_transpose(image).convert("RGB")
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
+        st.error(t("invalid_image", lang))
+        return None, "error"
+
+    if max(image.size) > MAX_IMAGE_DIMENSION:
+        image.thumbnail(
+            (MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION),
+            Image.Resampling.LANCZOS,
+        )
+
+    img_rgb = np.asarray(image, dtype=np.uint8).copy()
+    digest = hashlib.sha256(img_rgb.tobytes()).hexdigest()[:16]
+    cache_key = f"{source}-{digest}-{img_rgb.shape[0]}x{img_rgb.shape[1]}"
     return img_rgb, cache_key
 
 
@@ -222,7 +252,8 @@ def render_analyze_step():
     # -------------------------
     img_rgb, cache_key = _read_image_from_uploader_or_camera()
     if img_rgb is None:
-        st.info("Upload/Camera → rectify → propose → refine → map → confirm → analyze")
+        if cache_key is None:
+            st.info(t("workflow_help", lang))
         return
 
     need = int(st.session_state.arrows_per_end)
@@ -231,43 +262,58 @@ def render_analyze_step():
     # CV pipeline (cached)
     # -------------------------
     if st.session_state.get("cv_cache_key") != cache_key:
-        rect_res = rectify_target(img_rgb, out_size=CANON_SIZE)
+        try:
+            with st.spinner(t("processing_photo", lang)):
+                rect_res = rectify_target(img_rgb, out_size=CANON_SIZE)
 
-        face_bgr = render_target_face_bgr(
-            st.session_state.target_face,
-            size=CANON_SIZE,
-            center=CANON_CENTER,
-            outer_radius=CANON_OUTER,
-            draw_ring_lines=True,
-            ring_line_thickness=2,
-        )
+                face_bgr = render_target_face_bgr(
+                    st.session_state.target_face,
+                    size=CANON_SIZE,
+                    center=CANON_CENTER,
+                    outer_radius=CANON_OUTER,
+                    draw_ring_lines=True,
+                    ring_line_thickness=2,
+                )
 
-        coarse = propose_hit_points(
-            rect_res.rect_bgr, rect_res.center_final, rect_res.arrow_present, max_points=max(need, 12)
-        )
+                coarse = propose_hit_points(
+                    rect_res.rect_bgr,
+                    rect_res.center_final,
+                    rect_res.arrow_present,
+                    max_points=max(need, 12),
+                )
 
-        refined_rect_pts, _ = refine_points_and_colors(
-            rect_res.rect_bgr,
-            target_center=rect_res.center_final,
-            coarse_points=coarse,
-            arrow_present=rect_res.arrow_present,
-            roi_radius=70,
-        )
+                refined_rect_pts, _ = refine_points_and_colors(
+                    rect_res.rect_bgr,
+                    target_center=rect_res.center_final,
+                    coarse_points=coarse,
+                    arrow_present=rect_res.arrow_present,
+                    roi_radius=70,
+                )
 
-        auto_pts_canon = transform_points(refined_rect_pts, rect_res.M_rect_to_canon)
+                auto_pts_canon = transform_points(refined_rect_pts, rect_res.M_rect_to_canon)
 
-        st.session_state.cv_cache_key = cache_key
-        st.session_state.overlay_image_rgb = _bgr_to_rgb_uint8(face_bgr)
-        st.session_state.auto_points = auto_pts_canon
-        st.session_state.points = []
-        st.session_state.last_result = None
+            st.session_state.cv_cache_key = cache_key
+            st.session_state.overlay_image_rgb = _bgr_to_rgb_uint8(face_bgr)
+            st.session_state.auto_points = auto_pts_canon
+            st.session_state.points = []
+            st.session_state.last_result = None
 
-        st.session_state._geom_center = CANON_CENTER
-        st.session_state._geom_outer = CANON_OUTER
-        st.session_state._rect_photo_bgr = rect_res.rect_bgr.copy()
-        st.session_state._M_rect_to_canon = rect_res.M_rect_to_canon.copy()
-        st.session_state.warp_debug = rect_res.debug
-        st.session_state.cv_quality = {"score": float(rect_res.quality_score), "flags": list(rect_res.quality_flags)}
+            st.session_state._geom_center = CANON_CENTER
+            st.session_state._geom_outer = CANON_OUTER
+            st.session_state._rect_photo_bgr = rect_res.rect_bgr.copy()
+            st.session_state._M_rect_to_canon = rect_res.M_rect_to_canon.copy()
+            st.session_state.warp_debug = rect_res.debug
+            st.session_state.cv_quality = {
+                "score": float(rect_res.quality_score),
+                "flags": list(rect_res.quality_flags),
+            }
+        except Exception:
+            logger.exception("Target photo analysis failed")
+            reset_shot()
+            reset_cv_cache()
+            st.error(t("cv_error", lang))
+            st.caption(t("cv_error_hint", lang))
+            return
 
     bg_rgb = st.session_state.overlay_image_rgb
     auto_pts = st.session_state.auto_points
@@ -276,6 +322,10 @@ def render_analyze_step():
     quality = st.session_state.get("cv_quality", None)
 
     st.subheader(t("tap_points", lang))
+    if quality is not None and float(quality.get("score", 1.0)) < 0.55:
+        st.warning(t("quality_warning", lang))
+    if not auto_pts:
+        st.info(t("manual_points", lang))
     with st.expander("CV debug"):
         st.write(st.session_state.warp_debug)
         if quality is not None:
@@ -295,12 +345,12 @@ def render_analyze_step():
         width=700,
         drawing_mode="circle",
         initial_drawing=initial,
-        key="canvas_confirm",
+        key=f"canvas_confirm-{st.session_state.cv_cache_key}",
     )
 
     points = _extract_points_from_canvas(canvas.json_data)
     st.session_state.points = points
-    st.write(f"Marked: **{len(points)}** / {need}")
+    st.write(t("marked", lang).format(count=len(points), need=need))
 
     col1, col2 = st.columns([1, 1])
     with col1:

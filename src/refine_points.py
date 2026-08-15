@@ -5,6 +5,8 @@ from typing import List, Tuple, Dict, Any, Optional, Union
 import numpy as np
 import cv2
 
+from .cv_utils import normalize_hough_lines
+
 
 def _clip_roi(x, y, r, w, h):
     x1 = max(0, int(round(x - r)))
@@ -150,12 +152,13 @@ def _best_arrow_segment_in_roi(roi_g: np.ndarray, min_len: int) -> Optional[Tupl
         minLineLength=min_len,
         maxLineGap=10,
     )
-    if lines is None:
+    segments = normalize_hough_lines(lines)
+    if len(segments) == 0:
         return None
 
     best = None
     best_len = 0.0
-    for (x1, y1, x2, y2) in lines[:, 0, :]:
+    for x1, y1, x2, y2 in segments:
         L = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
         if L > best_len:
             best_len = L

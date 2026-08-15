@@ -18,6 +18,52 @@ TEXT = {
     "upload": {"ja": "的の写真をアップロード", "en": "Upload target photo", "zh": "上传靶面照片"},
     "camera": {"ja": "カメラで撮影", "en": "Take a photo", "zh": "用相机拍照"},
 
+    "workflow_help": {
+        "ja": "写真を追加すると、的を補正して着弾候補を表示します。最後に位置を確認して分析してください。",
+        "en": "Add a photo to detect the target and suggest hit points. Confirm the points before analyzing.",
+        "zh": "添加照片后，系统会校正靶面并建议命中点；请确认点位后再分析。",
+    },
+    "invalid_image": {
+        "ja": "画像を読み込めませんでした。PNG または JPEG の別の写真をお試しください。",
+        "en": "This image could not be read. Try another PNG or JPEG photo.",
+        "zh": "无法读取这张图片，请换一张 PNG 或 JPEG 照片。",
+    },
+    "image_too_large": {
+        "ja": "画像が大きすぎます。20 MB 以下の写真を選択してください。",
+        "en": "The image is too large. Choose a photo under 20 MB.",
+        "zh": "图片过大，请选择 20 MB 以下的照片。",
+    },
+    "processing_photo": {
+        "ja": "写真を解析しています…",
+        "en": "Analyzing the photo…",
+        "zh": "正在分析照片…",
+    },
+    "cv_error": {
+        "ja": "この写真を自動解析できませんでした。アプリは引き続き使用できます。",
+        "en": "Automatic analysis could not process this photo. The app is still available.",
+        "zh": "自动分析无法处理这张照片，但应用仍可继续使用。",
+    },
+    "cv_error_hint": {
+        "ja": "的全体が明るく、正面から写っている別の写真をお試しください。",
+        "en": "Try a well-lit, front-facing photo that includes the whole target.",
+        "zh": "请尝试光线充足、正对靶面并包含完整靶纸的照片。",
+    },
+    "quality_warning": {
+        "ja": "自動補正の信頼度が低めです。分析前に着弾点を確認・修正してください。",
+        "en": "Automatic alignment confidence is low. Check and adjust the hit points before analyzing.",
+        "zh": "自动校正可信度较低，请在分析前检查并调整命中点。",
+    },
+    "manual_points": {
+        "ja": "着弾候補を検出できませんでした。的の上をクリックして位置を追加してください。",
+        "en": "No hit candidates were found. Click the target to add the hit positions manually.",
+        "zh": "未检测到命中点，请点击靶面手动添加点位。",
+    },
+    "marked": {
+        "ja": "指定済み: **{count}** / {need}",
+        "en": "Marked: **{count}** / {need}",
+        "zh": "已标记：**{count}** / {need}",
+    },
+
     "tap_points": {"ja": "矢の位置をクリック（点で指定）", "en": "Confirm hits (edit points)", "zh": "确认命中点（编辑点位）"},
     "analyze": {"ja": "分析する", "en": "Analyze", "zh": "分析"},
     "clear": {"ja": "点をクリア", "en": "Clear points", "zh": "清空点位"},

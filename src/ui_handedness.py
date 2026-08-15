@@ -7,10 +7,11 @@ def render_handedness_step():
     st.title(t("choose_handedness", lang))
 
     handed = st.radio(
-        label="",
+        label=t("choose_handedness", lang),
         options=["right", "left"],
         format_func=lambda x: t(x, lang),
         index=0 if st.session_state.handedness == "right" else 1,
+        label_visibility="collapsed",
     )
     st.session_state.handedness = handed
 
