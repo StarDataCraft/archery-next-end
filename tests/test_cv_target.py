@@ -9,6 +9,8 @@ from src.cv_utils import normalize_hough_circles, normalize_hough_lines
 from src.cv_target import (
     _detect_arrow_present,
     _detect_x_center,
+    _fletched_shaft_candidates,
+    _paired_edge_shaft_candidates,
     _refine_circle,
     propose_hit_points,
     rectify_target,
@@ -234,6 +236,29 @@ class HitCandidateAccuracyTests(unittest.TestCase):
             for point in expected
         ]
         self.assertLess(max(nearest_errors), 12.0)
+
+    def test_paired_edges_recover_the_unfletched_shaft_without_hough_votes(self):
+        fixture = Path(__file__).parent / "fixtures" / "worn_target_five_arrows.jpg"
+        image = cv2.imread(str(fixture))
+        result = rectify_target(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        fletched, _ = _fletched_shaft_candidates(
+            result.rect_bgr,
+            result.center_final,
+            result.outer_radius,
+        )
+        paired = _paired_edge_shaft_candidates(
+            result.rect_bgr,
+            result.center_final,
+            result.outer_radius,
+            fletched,
+        )
+
+        self.assertGreaterEqual(len(paired), 1)
+        contacts = np.array([(x, y) for _, x, y in paired], dtype=np.float32)
+        self.assertLess(
+            float(np.min(np.linalg.norm(contacts - np.array((625.3, 531.6)), axis=1))),
+            6.0,
+        )
 
 
 if __name__ == "__main__":

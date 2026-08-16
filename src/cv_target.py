@@ -1214,6 +1214,187 @@ def _unfletched_shaft_candidates(
     return [candidate for candidate in ranked if candidate[0] >= threshold]
 
 
+def _paired_edge_shaft_candidates(
+    rect_bgr: np.ndarray,
+    center: Tuple[float, float],
+    outer_radius: float,
+    fletched: List[Tuple[float, float, float]],
+) -> List[Tuple[float, float, float]]:
+    """Trace an unfletched shaft from its two parallel visible edges.
+
+    ``HoughLinesP`` can return a different number of fragments across OpenCV
+    builds.  A line-segment detector gives us a complementary, deterministic
+    cue: a real shaft has two long, near-parallel sides a few pixels apart.
+    Once a pair is found, follow both edges inward until they disappear; that
+    disappearance is the contact point rather than merely the end of the first
+    detected segment.
+    """
+    gray = cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 1.0)
+    edge_map = cv2.Canny(blurred, 35, 110)
+    detected = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD).detect(blurred)[0]
+    lines = normalize_hough_lines(detected)
+    target = np.array(center, dtype=np.float64)
+    known_contacts = [np.array((x, y), dtype=np.float64) for _, x, y in fletched]
+
+    segments: List[Dict[str, object]] = []
+    for line in lines:
+        first = line[:2].astype(np.float64)
+        second = line[2:].astype(np.float64)
+        first_radius = float(np.linalg.norm(first - target))
+        second_radius = float(np.linalg.norm(second - target))
+        inward, outward = (
+            (first, second) if first_radius <= second_radius else (second, first)
+        )
+        vector = outward - inward
+        length = float(np.linalg.norm(vector))
+        if length < max(70.0, float(outer_radius) * 0.23):
+            continue
+        inward_radius = float(np.linalg.norm(inward - target))
+        outward_radius = float(np.linalg.norm(outward - target))
+        radial_span = outward_radius - inward_radius
+        if inward_radius > float(outer_radius) * 1.02:
+            continue
+        if outward_radius > float(outer_radius) * 1.10:
+            continue
+        if radial_span < float(outer_radius) * 0.16:
+            continue
+
+        direction = vector / max(length, 1e-6)
+        radial_direction = inward - target
+        radial_length = float(np.linalg.norm(radial_direction))
+        if radial_length < 1.0:
+            continue
+        alignment = abs(float(direction @ (radial_direction / radial_length)))
+        if alignment < float(np.cos(np.deg2rad(25.0))):
+            continue
+
+        # Lines belonging to a shaft that was already recovered through its
+        # coloured fletching must not be counted again as an unfletched arrow.
+        normal = np.array([-direction[1], direction[0]], dtype=np.float64)
+        if any(
+            abs(float((contact - inward) @ normal))
+            < float(outer_radius) * 0.055
+            for contact in known_contacts
+        ):
+            continue
+
+        segments.append(
+            {
+                "inward": inward,
+                "outward": outward,
+                "direction": direction,
+                "length": length,
+                "angle": float(np.degrees(np.arctan2(direction[1], direction[0])) % 180.0),
+            }
+        )
+
+    candidates: List[Tuple[float, float, float]] = []
+    for index, first in enumerate(segments):
+        for second in segments[index + 1 :]:
+            angle_delta = abs(float(first["angle"]) - float(second["angle"]))
+            angle_delta = min(angle_delta, 180.0 - angle_delta)
+            if angle_delta > 2.5:
+                continue
+
+            direction_a = np.asarray(first["direction"], dtype=np.float64)
+            direction_b = np.asarray(second["direction"], dtype=np.float64)
+            if float(direction_a @ direction_b) < 0.0:
+                direction_b *= -1.0
+            direction = direction_a + direction_b
+            direction /= max(float(np.linalg.norm(direction)), 1e-6)
+            normal = np.array([-direction[1], direction[0]], dtype=np.float64)
+
+            midpoint_a = (
+                np.asarray(first["inward"], dtype=np.float64)
+                + np.asarray(first["outward"], dtype=np.float64)
+            ) / 2.0
+            midpoint_b = (
+                np.asarray(second["inward"], dtype=np.float64)
+                + np.asarray(second["outward"], dtype=np.float64)
+            ) / 2.0
+            edge_separation = abs(float((midpoint_b - midpoint_a) @ normal))
+            if not (2.0 <= edge_separation <= max(16.0, float(outer_radius) * 0.045)):
+                continue
+
+            axis_values_a = [
+                float(np.asarray(first[key], dtype=np.float64) @ direction)
+                for key in ("inward", "outward")
+            ]
+            axis_values_b = [
+                float(np.asarray(second[key], dtype=np.float64) @ direction)
+                for key in ("inward", "outward")
+            ]
+            overlap = min(max(axis_values_a), max(axis_values_b)) - max(
+                min(axis_values_a), min(axis_values_b)
+            )
+            if overlap < max(45.0, float(outer_radius) * 0.12):
+                continue
+
+            seed = (
+                np.asarray(first["inward"], dtype=np.float64)
+                + np.asarray(second["inward"], dtype=np.float64)
+            ) / 2.0
+            if float(direction @ (seed - target)) < 0.0:
+                direction *= -1.0
+                normal *= -1.0
+
+            half_width = edge_separation / 2.0
+            band = max(2, min(4, int(round(half_width * 0.75))))
+            maximum_extension = max(35, int(round(float(outer_radius) * 0.30)))
+            maximum_gap = max(8, int(round(float(outer_radius) * 0.025)))
+            last_supported = -1
+            gap = 0
+            supported_steps = 0
+
+            for step in range(maximum_extension + 1):
+                point = seed - direction * float(step)
+                side_support: List[bool] = []
+                for side in (-1.0, 1.0):
+                    found = False
+                    edge_offset = side * half_width
+                    for delta in range(-band, band + 1):
+                        sample = point + normal * (edge_offset + float(delta))
+                        x = int(round(float(sample[0])))
+                        y = int(round(float(sample[1])))
+                        if 0 <= x < edge_map.shape[1] and 0 <= y < edge_map.shape[0]:
+                            if edge_map[y, x] > 0:
+                                found = True
+                                break
+                    side_support.append(found)
+
+                if all(side_support):
+                    last_supported = step
+                    supported_steps += 1
+                    gap = 0
+                else:
+                    gap += 1
+                    if gap > maximum_gap:
+                        break
+
+            extension = max(0, last_supported)
+            if extension < max(24, int(round(float(outer_radius) * 0.06))):
+                continue
+            support_ratio = supported_steps / max(extension + 1, 1)
+            if support_ratio < 0.55:
+                continue
+
+            contact = seed - direction * float(extension)
+            contact_radius = float(np.linalg.norm(contact - target))
+            if contact_radius > float(outer_radius) * 1.03:
+                continue
+            if any(
+                float(np.linalg.norm(contact - known)) < float(outer_radius) * 0.07
+                for known in known_contacts
+            ):
+                continue
+
+            confidence = float(overlap + extension * 4.0 + support_ratio * 120.0)
+            candidates.append((confidence, float(contact[0]), float(contact[1])))
+
+    return sorted(candidates, reverse=True)
+
+
 def _shaft_hit_candidates(
     rect_bgr: np.ndarray,
     center: Tuple[float, float],
@@ -1221,6 +1402,9 @@ def _shaft_hit_candidates(
 ) -> Tuple[List[Tuple[float, float]], bool]:
     fletched, groups = _fletched_shaft_candidates(rect_bgr, center, outer_radius)
     extra = _unfletched_shaft_candidates(rect_bgr, center, outer_radius, groups)
+    extra.extend(
+        _paired_edge_shaft_candidates(rect_bgr, center, outer_radius, fletched)
+    )
     shaft_mode = bool(groups or extra)
     ranked = list(fletched) + list(extra)
     ranked.sort(reverse=True)
