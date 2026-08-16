@@ -12,6 +12,7 @@ from src.cv_target import (
     _fletched_shaft_candidates,
     _paired_edge_shaft_candidates,
     _refine_circle,
+    _shaft_hit_candidates,
     propose_hit_points,
     rectify_target,
     transform_points,
@@ -259,6 +260,103 @@ class HitCandidateAccuracyTests(unittest.TestCase):
             float(np.min(np.linalg.norm(contacts - np.array((625.3, 531.6)), axis=1))),
             6.0,
         )
+
+    def test_real_target_stays_accurate_after_resize_compression_and_blur(self):
+        fixture = Path(__file__).parent / "fixtures" / "worn_target_five_arrows.jpg"
+        image = cv2.imread(str(fixture))
+        encoded_ok, encoded = cv2.imencode(
+            ".jpg",
+            image,
+            [cv2.IMWRITE_JPEG_QUALITY, 35],
+        )
+        self.assertTrue(encoded_ok)
+        variants = {
+            "half_size": cv2.resize(
+                image,
+                None,
+                fx=0.5,
+                fy=0.5,
+                interpolation=cv2.INTER_AREA,
+            ),
+            "jpeg_35": cv2.imdecode(encoded, cv2.IMREAD_COLOR),
+            "slight_blur": cv2.GaussianBlur(image, (0, 0), 1.2),
+            "bright": np.clip(image.astype(np.float32) * 1.32 + 8, 0, 255).astype(
+                np.uint8
+            ),
+        }
+        expected = np.array(
+            [
+                (366.8, 392.5),
+                (427.9, 406.1),
+                (351.0, 412.1),
+                (448.1, 522.1),
+                (625.3, 531.6),
+            ],
+            dtype=np.float32,
+        )
+
+        for name, variant in variants.items():
+            with self.subTest(name=name):
+                result = rectify_target(cv2.cvtColor(variant, cv2.COLOR_BGR2RGB))
+                diagnostics = {}
+                proposed_rect = propose_hit_points(
+                    result.rect_bgr,
+                    result.center_final,
+                    result.arrow_present,
+                    max_points=12,
+                    outer_radius=result.outer_radius,
+                    diagnostics=diagnostics,
+                )
+                proposed = np.array(
+                    transform_points(proposed_rect, result.M_rect_to_canon),
+                    dtype=np.float32,
+                )
+                self.assertEqual(diagnostics["mode"], "visible_shafts")
+                self.assertEqual(len(proposed), 5)
+                nearest_errors = [
+                    float(np.min(np.linalg.norm(proposed - point, axis=1)))
+                    for point in expected
+                ]
+                self.assertLess(max(nearest_errors), 22.0)
+
+    def test_dim_target_is_flagged_instead_of_claiming_full_image_confidence(self):
+        fixture = Path(__file__).parent / "fixtures" / "worn_target_five_arrows.jpg"
+        image = cv2.imread(str(fixture))
+        dimmed = np.clip(image.astype(np.float32) * 0.62, 0, 255).astype(np.uint8)
+
+        result = rectify_target(cv2.cvtColor(dimmed, cv2.COLOR_BGR2RGB))
+
+        self.assertIn("image_low_contrast", result.quality_flags)
+        self.assertLess(result.debug["image_contrast"], 170.0)
+
+    @patch("src.cv_target._paired_edge_shaft_candidates", return_value=[])
+    @patch("src.cv_target._unfletched_shaft_candidates", return_value=[])
+    @patch("src.cv_target._fletched_shaft_candidates")
+    def test_untraced_colour_blob_does_not_force_visible_shaft_mode(
+        self,
+        fletched,
+        _unfletched,
+        _paired,
+    ):
+        fletched.return_value = (
+            [],
+            [
+                {
+                    "center": np.array((200.0, 200.0)),
+                    "area": 500,
+                    "mask": self.clean_target[:, :, 0],
+                }
+            ],
+        )
+
+        points, shaft_mode = _shaft_hit_candidates(
+            self.clean_target,
+            (200.0, 200.0),
+            180.0,
+        )
+
+        self.assertEqual(points, [])
+        self.assertFalse(shaft_mode)
 
 
 if __name__ == "__main__":

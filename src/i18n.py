@@ -58,6 +58,11 @@ TEXT = {
         "en": "The photo is too blurred for reliable automatic points. Add them manually or use a sharper photo.",
         "zh": "照片较模糊，自动点位可能不可靠，因此已停止自动标点；请手动添加或换一张更清晰的照片。",
     },
+    "contrast_warning": {
+        "ja": "写真の明暗差が不足しているため、細いシャフトの位置が不安定になる可能性があります。明るい場所で撮り直すことをおすすめします。",
+        "en": "The photo has too little contrast for stable thin-shaft positions. Retake it in brighter, more even light.",
+        "zh": "照片明暗对比不足，细箭杆的位置可能不稳定；建议在更明亮、均匀的光线下重新拍摄。",
+    },
     "partial_points": {
         "ja": "高確信の候補を {count} / {need} 点だけ表示しています。残りはクリックで追加してください。",
         "en": "Only {count} of {need} high-confidence candidates were kept. Click to add the rest.",

@@ -444,6 +444,8 @@ def render_analyze_step():
         )
     if "image_blur" in quality_flags:
         st.warning(t("blur_warning", lang))
+    elif "image_low_contrast" in quality_flags:
+        st.warning(t("contrast_warning", lang))
     elif quality is not None and float(quality.get("score", 1.0)) < 0.55:
         st.warning(t("quality_warning", lang))
     if not auto_pts:

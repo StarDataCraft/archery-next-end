@@ -35,6 +35,7 @@ CANON_SIZE = 900
 CANON_CENTER = (CANON_SIZE / 2.0, CANON_SIZE / 2.0)
 CANON_OUTER = CANON_SIZE * 0.45  # 405
 MIN_IMAGE_SHARPNESS = 90.0
+MIN_IMAGE_CONTRAST = 170.0
 
 
 def _rgb_to_bgr(rgb: np.ndarray) -> np.ndarray:
@@ -51,6 +52,27 @@ def _largest_contour(edge: np.ndarray) -> Optional[np.ndarray]:
 def _odd_kernel(value: float, minimum: int = 3) -> int:
     size = max(int(minimum), int(round(float(value))))
     return size if size % 2 == 1 else size + 1
+
+
+def _normalize_gray_contrast(gray: np.ndarray) -> np.ndarray:
+    """Return a percentile-stretched grayscale image for edge detection.
+
+    Fixed Canny/LSD thresholds otherwise lose thin carbon shafts in dark or
+    low-contrast uploads even though the same geometry is plainly visible.
+    Percentiles avoid letting a few clipped highlights or black holes set the
+    whole range.
+    """
+    source = np.asarray(gray, dtype=np.uint8)
+    low, high = np.percentile(source, (2.0, 98.0))
+    if float(high - low) < 24.0:
+        return source.copy()
+    stretched = (source.astype(np.float32) - float(low)) * (255.0 / float(high - low))
+    return np.clip(stretched, 0.0, 255.0).astype(np.uint8)
+
+
+def _gray_contrast_span(gray: np.ndarray) -> float:
+    low, high = np.percentile(np.asarray(gray, dtype=np.uint8), (2.0, 98.0))
+    return float(high - low)
 
 
 def _fit_colored_target_ellipse(
@@ -628,6 +650,11 @@ def _quality_from_debug(debug: Dict[str, object]) -> Tuple[float, List[str]]:
         score -= 0.25
         flags.append("image_blur")
 
+    contrast = float(debug.get("image_contrast", 255.0) or 0.0)
+    if contrast < MIN_IMAGE_CONTRAST:
+        score -= 0.15
+        flags.append("image_low_contrast")
+
     score = float(max(0.0, min(1.0, score)))
     if score < 0.55:
         flags.append("low_confidence")
@@ -645,17 +672,20 @@ def rectify_target(image_rgb: np.ndarray, out_size: int = CANON_SIZE) -> TargetR
         center = (out_size / 2.0, out_size / 2.0)
         outer_radius = float(out_size) * 0.45
         arrow_present, line_count = _detect_arrow_present(color_rect)
+        color_gray = cv2.cvtColor(color_rect, cv2.COLOR_BGR2GRAY)
         sharpness = float(
             cv2.Laplacian(
-                cv2.cvtColor(color_rect, cv2.COLOR_BGR2GRAY),
+                color_gray,
                 cv2.CV_64F,
             ).var()
         )
+        contrast = _gray_contrast_span(color_gray)
         color_debug.update(
             {
                 "arrow_present": arrow_present,
                 "line_count": int(line_count),
                 "image_sharpness": sharpness,
+                "image_contrast": contrast,
                 "center_final_source": "color_ring",
                 "outer_radius_source": "red_zone_ratio",
             }
@@ -670,6 +700,9 @@ def rectify_target(image_rgb: np.ndarray, out_size: int = CANON_SIZE) -> TargetR
         if sharpness < MIN_IMAGE_SHARPNESS:
             quality_score -= 0.25
             quality_flags.append("image_blur")
+        if contrast < MIN_IMAGE_CONTRAST:
+            quality_score -= 0.15
+            quality_flags.append("image_low_contrast")
         quality_score = float(max(0.0, min(1.0, quality_score)))
         if quality_score < 0.55:
             quality_flags.append("low_confidence")
@@ -713,6 +746,7 @@ def rectify_target(image_rgb: np.ndarray, out_size: int = CANON_SIZE) -> TargetR
 
     gray_rect3 = cv2.cvtColor(rect3, cv2.COLOR_BGR2GRAY)
     debug["image_sharpness"] = float(cv2.Laplacian(gray_rect3, cv2.CV_64F).var())
+    debug["image_contrast"] = _gray_contrast_span(gray_rect3)
 
     # after rotation, re-refine circle
     (ccx2, ccy2), rr2, dbg_circle2 = _refine_circle(rect3)
@@ -888,6 +922,124 @@ def _fletch_angle_candidates(component_mask: np.ndarray) -> List[Tuple[float, fl
     return sorted(peaks, reverse=True)[:3]
 
 
+def _image_shaft_angle_candidates(
+    lines: np.ndarray,
+    group_center: np.ndarray,
+    outer_radius: float,
+) -> List[Tuple[float, float]]:
+    """Find line directions that visibly pass through a fletching group."""
+    histogram = np.zeros(90, dtype=np.float64)
+    maximum_distance = max(14.0, float(outer_radius) * 0.045)
+    minimum_length = max(32.0, float(outer_radius) * 0.08)
+
+    for x_start, y_start, x_end, y_end in lines:
+        start = np.array((x_start, y_start), dtype=np.float64)
+        vector = np.array((x_end - x_start, y_end - y_start), dtype=np.float64)
+        length = float(np.linalg.norm(vector))
+        if length < minimum_length:
+            continue
+        distance = abs(
+            vector[0] * (float(group_center[1]) - start[1])
+            - vector[1] * (float(group_center[0]) - start[0])
+        ) / max(length, 1e-6)
+        projection = float((group_center - start) @ vector / max(length * length, 1e-6))
+        if distance > maximum_distance or not (-0.8 < projection < 1.8):
+            continue
+        angle = float(np.degrees(np.arctan2(vector[1], vector[0])) % 180.0)
+        histogram[int(round(angle / 2.0)) % 90] += length / (distance + 8.0)
+
+    smoothed = histogram + 0.5 * np.roll(histogram, 1) + 0.5 * np.roll(histogram, -1)
+    candidates: List[Tuple[float, float]] = []
+    for index in np.argsort(smoothed)[::-1]:
+        weight = float(smoothed[index])
+        if weight < 1.0:
+            break
+        angle = float((int(index) * 2) % 180)
+        if any(
+            min(abs(angle - existing), 180.0 - abs(angle - existing)) < 8.0
+            for _, existing in candidates
+        ):
+            continue
+        candidates.append((weight, angle))
+        if len(candidates) >= 5:
+            break
+    return candidates
+
+
+def _fused_shaft_angle_candidates(
+    mask_candidates: List[Tuple[float, float]],
+    image_candidates: List[Tuple[float, float]],
+) -> List[Tuple[float, float]]:
+    """Prefer directions supported by both vane shape and a visible shaft."""
+    consensus: List[Tuple[float, float]] = []
+    for image_weight, image_angle in image_candidates:
+        for mask_weight, mask_angle in mask_candidates:
+            delta = abs(float(image_angle) - float(mask_angle))
+            delta = min(delta, 180.0 - delta)
+            if delta > 14.0:
+                continue
+            weight = (
+                float(image_weight)
+                * float(np.sqrt(max(float(mask_weight), 1.0)))
+                / (1.0 + delta * 0.20)
+            )
+            # The image line validates the shaft family, while the vane edge
+            # usually gives the better centre-line angle (the visible line is
+            # often only one side of a thick or blurred shaft).
+            consensus.append((weight, float(mask_angle)))
+
+    if consensus:
+        # The image line is the shaft itself; the coloured vane only validates
+        # that line. A single consensus direction avoids following a stronger
+        # perpendicular vane edge into an old target hole.
+        return [max(consensus, key=lambda item: item[0])]
+    return mask_candidates
+
+
+def _image_shaft_direction_hint(
+    lines: np.ndarray,
+    group_center: np.ndarray,
+    angle_deg: float,
+    outer_radius: float,
+) -> Optional[np.ndarray]:
+    """Orient an undirected shaft angle toward the side containing its line."""
+    axis = np.array(
+        [np.cos(np.deg2rad(float(angle_deg))), np.sin(np.deg2rad(float(angle_deg)))],
+        dtype=np.float64,
+    )
+    negative_extent = 0.0
+    positive_extent = 0.0
+    maximum_distance = max(14.0, float(outer_radius) * 0.045)
+    minimum_length = max(32.0, float(outer_radius) * 0.08)
+
+    for x_start, y_start, x_end, y_end in lines:
+        start = np.array((x_start, y_start), dtype=np.float64)
+        end = np.array((x_end, y_end), dtype=np.float64)
+        vector = end - start
+        length = float(np.linalg.norm(vector))
+        if length < minimum_length:
+            continue
+        line_angle = float(np.degrees(np.arctan2(vector[1], vector[0])) % 180.0)
+        angle_delta = abs(line_angle - float(angle_deg))
+        angle_delta = min(angle_delta, 180.0 - angle_delta)
+        if angle_delta > 5.0:
+            continue
+        distance = abs(
+            vector[0] * (float(group_center[1]) - start[1])
+            - vector[1] * (float(group_center[0]) - start[0])
+        ) / max(length, 1e-6)
+        projection = float((group_center - start) @ vector / max(length * length, 1e-6))
+        if distance > maximum_distance or not (-0.8 < projection < 1.8):
+            continue
+        positions = [float((point - group_center) @ axis) for point in (start, end)]
+        positive_extent += max(0.0, max(positions))
+        negative_extent += max(0.0, -min(positions))
+
+    if max(positive_extent, negative_extent) < minimum_length * 0.65:
+        return None
+    return axis if positive_extent >= negative_extent else -axis
+
+
 def _dark_shaft_chain(
     lightness: np.ndarray,
     group_center: np.ndarray,
@@ -1009,12 +1161,22 @@ def _fletched_shaft_candidates(
     if not groups:
         return [], []
 
-    lightness = cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2Lab)[:, :, 0].astype(np.float32)
+    raw_lightness = cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2Lab)[:, :, 0]
+    lightness = _normalize_gray_contrast(raw_lightness).astype(np.float32)
+    line_gray = _normalize_gray_contrast(cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2GRAY))
+    line_gray = cv2.GaussianBlur(line_gray, (5, 5), 1.0)
+    shaft_lines = normalize_hough_lines(
+        cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD).detect(line_gray)[0]
+    )
     candidates: List[Tuple[float, float, float]] = []
     accepted_groups: List[Dict[str, object]] = []
     target = np.array(center, dtype=np.float64)
 
-    def trace(group_center: np.ndarray, angle: float) -> Dict[str, object]:
+    def trace(
+        group_center: np.ndarray,
+        angle: float,
+        direction_hint: Optional[np.ndarray] = None,
+    ) -> Dict[str, object]:
         directions = [
             _dark_shaft_chain(
                 lightness,
@@ -1032,6 +1194,14 @@ def _fletched_shaft_candidates(
             for result in directions
             if int(result["span"]) >= max(1, int(maximum_span * 0.85))
         ]
+
+        if direction_hint is not None:
+            aligned = max(
+                directions,
+                key=lambda result: float(np.asarray(result["direction"]) @ direction_hint),
+            )
+            if int(aligned["span"]) >= max(1, int(maximum_span * 0.55)):
+                return aligned
 
         def endpoint_texture(result: Dict[str, object]) -> float:
             endpoint = group_center + result["direction"] * float(result["end"])
@@ -1064,29 +1234,87 @@ def _fletched_shaft_candidates(
         )
 
     for group in groups:
-        angle_peaks = _fletch_angle_candidates(group["mask"])
+        mask_peaks = _fletch_angle_candidates(group["mask"])
+        image_peaks = _image_shaft_angle_candidates(
+            shaft_lines,
+            group["center"],
+            outer_radius,
+        )
+        angle_peaks = _fused_shaft_angle_candidates(mask_peaks, image_peaks)
         if not angle_peaks:
             continue
         base_results = []
         for hough_weight, angle in angle_peaks:
-            result = trace(group["center"], angle)
+            direction_hint = _image_shaft_direction_hint(
+                shaft_lines,
+                group["center"],
+                angle,
+                outer_radius,
+            )
+            result = trace(group["center"], angle, direction_hint)
             result["group_center"] = group["center"]
-            base_results.append((result, hough_weight))
-        base, _ = max(
+            base_results.append((result, hough_weight, direction_hint))
+        base, _, direction_hint = max(
             base_results,
             key=lambda item: trace_score(item[0], item[1]),
         )
         if int(base["span"]) < max(45, int(float(outer_radius) * 0.11)):
             continue
 
+        matching_image_angle: Optional[float] = None
+        if image_peaks:
+            _, nearest_image_angle = min(
+                image_peaks,
+                key=lambda item: min(
+                    abs(float(item[1]) - float(base["angle"])),
+                    180.0 - abs(float(item[1]) - float(base["angle"])),
+                ),
+            )
+            nearest_delta = (
+                (float(nearest_image_angle) - float(base["angle"]) + 90.0) % 180.0
+            ) - 90.0
+            if abs(nearest_delta) <= 14.0:
+                matching_image_angle = float(nearest_image_angle)
+
+        if matching_image_angle is None:
+            refinement_offsets = np.arange(-4.0, 4.01, 0.5)
+        else:
+            signed_delta = (
+                (matching_image_angle - float(base["angle"]) + 90.0) % 180.0
+            ) - 90.0
+            if abs(signed_delta) < 0.75:
+                refinement_offsets = np.array([0.0])
+            else:
+                lower = max(-4.0, min(0.0, signed_delta) - 0.5)
+                upper = min(4.0, max(0.0, signed_delta) + 0.5)
+                refinement_offsets = np.arange(lower, upper + 0.01, 0.5)
+
         refined_results = []
-        for offset in np.arange(-4.0, 4.01, 0.5):
-            result = trace(group["center"], (float(base["angle"]) + offset) % 180.0)
+        for offset in refinement_offsets:
+            result = trace(
+                group["center"],
+                (float(base["angle"]) + offset) % 180.0,
+                direction_hint,
+            )
             result["group_center"] = group["center"]
+            result["angle_offset"] = float(offset)
             refined_results.append(result)
+        selection_pool = refined_results
+        if float(np.linalg.norm(group["center"] - target)) < float(outer_radius) * 0.10:
+            # When the vane itself overlaps the bull, a long dark chain is
+            # commonly a printed ring or an old-hole trail. Keep the endpoint
+            # within a plausible visible shaft length from that vane.
+            nearby = [
+                result
+                for result in refined_results
+                if float(result["end"]) <= float(outer_radius) * 0.40
+            ]
+            if nearby:
+                selection_pool = nearby
         refined = max(
-            refined_results,
-            key=trace_score,
+            selection_pool,
+            key=lambda result: trace_score(result)
+            * float(np.exp(-0.5 * (float(result["angle_offset"]) / 4.0) ** 2)),
         )
         endpoint = group["center"] + refined["direction"] * float(refined["end"])
         if np.linalg.norm(endpoint - target) > float(outer_radius) * 1.05:
@@ -1229,9 +1457,9 @@ def _paired_edge_shaft_candidates(
     disappearance is the contact point rather than merely the end of the first
     detected segment.
     """
-    gray = cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2GRAY)
+    gray = _normalize_gray_contrast(cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2GRAY))
     blurred = cv2.GaussianBlur(gray, (5, 5), 1.0)
-    edge_map = cv2.Canny(blurred, 35, 110)
+    edge_map = cv2.Canny(blurred, 25, 80)
     detected = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD).detect(blurred)[0]
     lines = normalize_hough_lines(detected)
     target = np.array(center, dtype=np.float64)
@@ -1273,8 +1501,20 @@ def _paired_edge_shaft_candidates(
         # coloured fletching must not be counted again as an unfletched arrow.
         normal = np.array([-direction[1], direction[0]], dtype=np.float64)
         if any(
-            abs(float((contact - inward) @ normal))
-            < float(outer_radius) * 0.055
+            (
+                abs(float((contact - inward) @ normal))
+                < float(outer_radius) * 0.035
+                and -3.2
+                < float((contact - inward) @ direction / max(length, 1e-6))
+                < 1.5
+            )
+            or (
+                abs(float((contact - inward) @ normal))
+                < float(outer_radius) * 0.055
+                and -1.5
+                < float((contact - inward) @ direction / max(length, 1e-6))
+                < 1.5
+            )
             for contact in known_contacts
         ):
             continue
@@ -1392,6 +1632,59 @@ def _paired_edge_shaft_candidates(
             confidence = float(overlap + extension * 4.0 + support_ratio * 120.0)
             candidates.append((confidence, float(contact[0]), float(contact[1])))
 
+    # Compression and dim lighting can erase one side of a thin shaft. A
+    # single long edge is still useful when it is radial, does not coincide
+    # with a fletched shaft, and can be followed continuously inward to a
+    # clear disappearance point.
+    for segment in segments:
+        seed = np.asarray(segment["inward"], dtype=np.float64)
+        direction = np.asarray(segment["direction"], dtype=np.float64)
+        normal = np.array([-direction[1], direction[0]], dtype=np.float64)
+        maximum_extension = max(35, int(round(float(outer_radius) * 0.30)))
+        maximum_gap = max(8, int(round(float(outer_radius) * 0.025)))
+        last_supported = -1
+        supported_steps = 0
+        gap = 0
+
+        for step in range(maximum_extension + 1):
+            point = seed - direction * float(step)
+            found = False
+            for offset in range(-3, 4):
+                sample = point + normal * float(offset)
+                x = int(round(float(sample[0])))
+                y = int(round(float(sample[1])))
+                if 0 <= x < edge_map.shape[1] and 0 <= y < edge_map.shape[0]:
+                    if edge_map[y, x] > 0:
+                        found = True
+                        break
+            if found:
+                last_supported = step
+                supported_steps += 1
+                gap = 0
+            else:
+                gap += 1
+                if gap > maximum_gap:
+                    break
+
+        extension = max(0, last_supported)
+        if extension < max(24, int(round(float(outer_radius) * 0.06))):
+            continue
+        support_ratio = supported_steps / max(extension + 1, 1)
+        if support_ratio < 0.62:
+            continue
+        contact = seed - direction * float(extension)
+        if float(np.linalg.norm(contact - target)) > float(outer_radius) * 1.03:
+            continue
+        if any(
+            float(np.linalg.norm(contact - known)) < float(outer_radius) * 0.07
+            for known in known_contacts
+        ):
+            continue
+        confidence = float(
+            float(segment["length"]) + extension * 3.0 + support_ratio * 80.0
+        )
+        candidates.append((confidence, float(contact[0]), float(contact[1])))
+
     return sorted(candidates, reverse=True)
 
 
@@ -1405,7 +1698,9 @@ def _shaft_hit_candidates(
     extra.extend(
         _paired_edge_shaft_candidates(rect_bgr, center, outer_radius, fletched)
     )
-    shaft_mode = bool(groups or extra)
+    # A saturated colour blob alone is not proof of a current arrow. Only an
+    # accepted traced shaft may suppress the historical-hole fallback.
+    shaft_mode = bool(fletched or extra)
     ranked = list(fletched) + list(extra)
     ranked.sort(reverse=True)
 
