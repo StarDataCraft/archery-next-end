@@ -18,7 +18,7 @@ from .metrics import compute_metrics, classify_shape
 from .rules import next_end_advice
 from .storage import make_log_entry, export_log_json
 from .cv_target import rectify_target, transform_points, propose_hit_points
-from .refine_points import refine_points_and_colors, sample_contact_color_hsv
+from .refine_points import sample_contact_color_hsv
 from .scoring import score_hits_color_aware
 from .target_face import render_target_face_bgr, TARGET_FACES
 from .coach import CoachRAG, CoachConfig
@@ -371,17 +371,13 @@ def render_analyze_step():
                     rect_res.center_final,
                     rect_res.arrow_present,
                     max_points=max(need, 12),
+                    outer_radius=rect_res.outer_radius,
                 )
 
-                refined_rect_pts, _ = refine_points_and_colors(
-                    rect_res.rect_bgr,
-                    target_center=rect_res.center_final,
-                    coarse_points=coarse,
-                    arrow_present=rect_res.arrow_present,
-                    roi_radius=70,
-                )
-
-                auto_pts_canon = transform_points(refined_rect_pts, rect_res.M_rect_to_canon)
+                # Radial-anomaly candidates are already weighted centroids or
+                # shaft endpoints. A second generic edge search can snap them
+                # back to a nearby printed ring, so map them directly.
+                auto_pts_canon = transform_points(coarse, rect_res.M_rect_to_canon)
 
             st.session_state.cv_cache_key = cache_key
             st.session_state.overlay_image_rgb = _bgr_to_rgb_uint8(face_bgr)
@@ -419,10 +415,20 @@ def render_analyze_step():
 
     st.subheader(t("tap_points", lang))
     st.caption(t("mapped_target_hint", lang))
-    if quality is not None and float(quality.get("score", 1.0)) < 0.55:
+    quality_flags = set((quality or {}).get("flags", []) or [])
+    if "image_blur" in quality_flags:
+        st.warning(t("blur_warning", lang))
+    elif quality is not None and float(quality.get("score", 1.0)) < 0.55:
         st.warning(t("quality_warning", lang))
     if not auto_pts:
         st.info(t("manual_points", lang))
+    elif len(st.session_state.points) < need:
+        st.info(
+            t("partial_points", lang).format(
+                count=len(st.session_state.points),
+                need=need,
+            )
+        )
     with st.expander(t("metric_debug", lang)):
         st.write(st.session_state.warp_debug)
         if quality is not None:

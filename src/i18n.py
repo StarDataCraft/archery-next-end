@@ -53,6 +53,16 @@ TEXT = {
         "en": "Automatic alignment confidence is low. Check and adjust the hit points before analyzing.",
         "zh": "自动校正可信度较低，请在分析前检查并调整命中点。",
     },
+    "blur_warning": {
+        "ja": "写真のぼけが大きいため、自動点は表示しません。位置を手動で追加するか、より鮮明な写真を使用してください。",
+        "en": "The photo is too blurred for reliable automatic points. Add them manually or use a sharper photo.",
+        "zh": "照片较模糊，自动点位可能不可靠，因此已停止自动标点；请手动添加或换一张更清晰的照片。",
+    },
+    "partial_points": {
+        "ja": "高確信の候補を {count} / {need} 点だけ表示しています。残りはクリックで追加してください。",
+        "en": "Only {count} of {need} high-confidence candidates were kept. Click to add the rest.",
+        "zh": "仅保留了 {count} / {need} 个高可信候选点；请点击补充其余点位。",
+    },
     "manual_points": {
         "ja": "着弾候補を検出できませんでした。的の上をクリックして位置を追加してください。",
         "en": "No hit candidates were found. Click the target to add the hit positions manually.",

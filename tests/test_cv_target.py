@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import patch
 
+import cv2
 import numpy as np
 
 from src.cv_utils import normalize_hough_circles, normalize_hough_lines
@@ -10,8 +11,10 @@ from src.cv_target import (
     _refine_circle,
     propose_hit_points,
     rectify_target,
+    transform_points,
 )
 from src.refine_points import _best_arrow_segment_in_roi
+from src.target_face import render_target_face_bgr
 
 
 class NormalizeHoughLinesTests(unittest.TestCase):
@@ -98,6 +101,99 @@ class HoughFallbackTests(unittest.TestCase):
         )
 
         self.assertEqual(line, (3, 4, 80, 90))
+
+
+class HitCandidateAccuracyTests(unittest.TestCase):
+    def setUp(self):
+        self.truth = np.array(
+            [
+                (430.0, 440.0),
+                (447.0, 425.0),
+                (461.0, 448.0),
+                (440.0, 468.0),
+                (472.0, 465.0),
+                (620.0, 540.0),
+            ],
+            dtype=np.float32,
+        )
+        self.clean_target = render_target_face_bgr(
+            "80cm_10ring",
+            size=900,
+            center=(450.0, 450.0),
+            outer_radius=405.0,
+            draw_ring_lines=True,
+            ring_line_thickness=2,
+        )
+
+    def _rectify_and_propose(self, bgr):
+        result = rectify_target(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+        proposed = propose_hit_points(
+            result.rect_bgr,
+            result.center_final,
+            result.arrow_present,
+            max_points=12,
+            outer_radius=result.outer_radius,
+        )
+        return result, np.array(
+            transform_points(proposed, result.M_rect_to_canon),
+            dtype=np.float32,
+        )
+
+    def test_clean_target_does_not_invent_hit_points_from_ring_lines(self):
+        _, proposed = self._rectify_and_propose(self.clean_target.copy())
+
+        self.assertEqual(proposed.shape, (0,))
+
+    def test_six_dark_holes_are_recovered_without_merging_a_tight_group(self):
+        image = self.clean_target.copy()
+        for x, y in self.truth.astype(int):
+            cv2.circle(image, (int(x), int(y)), 7, (30, 30, 30), thickness=-1)
+
+        result, proposed = self._rectify_and_propose(image)
+
+        self.assertTrue(result.debug["ellipse_rotation_skipped"])
+        self.assertEqual(len(proposed), len(self.truth))
+        nearest_errors = [
+            float(np.min(np.linalg.norm(proposed - expected, axis=1)))
+            for expected in self.truth
+        ]
+        self.assertLess(max(nearest_errors), 4.0)
+
+    def test_affine_camera_squash_is_corrected_before_mapping_points(self):
+        image = self.clean_target.copy()
+        for x, y in self.truth.astype(int):
+            cv2.circle(image, (int(x), int(y)), 7, (30, 30, 30), thickness=-1)
+        squash = np.array(
+            [[1.0, 0.0, 0.0], [0.0, 0.75, 450.0 * 0.25]],
+            dtype=np.float32,
+        )
+        distorted = cv2.warpAffine(
+            image,
+            squash,
+            (900, 900),
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
+        )
+
+        _, proposed = self._rectify_and_propose(distorted)
+
+        self.assertEqual(len(proposed), len(self.truth))
+        nearest_errors = [
+            float(np.min(np.linalg.norm(proposed - expected, axis=1)))
+            for expected in self.truth
+        ]
+        self.assertLess(max(nearest_errors), 5.0)
+
+    def test_blurred_photo_does_not_emit_confident_but_wrong_points(self):
+        image = self.clean_target.copy()
+        for x, y in self.truth.astype(int):
+            cv2.circle(image, (int(x), int(y)), 7, (30, 30, 30), thickness=-1)
+        blurred = cv2.GaussianBlur(image, (5, 5), 1.1)
+
+        result, proposed = self._rectify_and_propose(blurred)
+
+        self.assertIn("image_blur", result.quality_flags)
+        self.assertEqual(proposed.shape, (0,))
 
 
 if __name__ == "__main__":

@@ -79,19 +79,42 @@ def _affine_rectify_by_ellipse(bgr: np.ndarray) -> Tuple[np.ndarray, Dict[str, o
         }
     )
 
-    rot = cv2.getRotationMatrix2D((cx, cy), -angle, 1.0)
-    rotated = cv2.warpAffine(
-        bgr, rot, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
-    )
+    axis_ratio = float(major / minor)
+    dbg["ellipse_axis_ratio"] = axis_ratio
+    if axis_ratio < 1.03:
+        # fitEllipse's angle is numerically unstable for an almost circular
+        # target. Rotating by that arbitrary angle moves otherwise correct hit
+        # points tangentially (several pixels near the outer rings).
+        dbg["ellipse_rotation_skipped"] = True
+        dbg["affine_scale_y"] = 1.0
+        return bgr.copy(), dbg
 
-    scale = major / minor
-    S = np.array(
-        [[1.0, 0.0, 0.0], [0.0, scale, cy * (1.0 - scale)]], dtype=np.float32
+    # Scale along the fitted ellipse axes, then rotate that scaling basis back
+    # into image coordinates. The previous rotate-then-scale implementation
+    # left the target rotated and often stretched the *major* axis when
+    # fitEllipse reported its first axis vertically.
+    theta = np.deg2rad(float(angle))
+    axis_a = np.array([np.cos(theta), np.sin(theta)], dtype=np.float64)
+    axis_b = np.array([-np.sin(theta), np.cos(theta)], dtype=np.float64)
+    scale_a = float(major / max(float(a), 1e-6))
+    scale_b = float(major / max(float(b), 1e-6))
+    linear = (
+        scale_a * np.outer(axis_a, axis_a)
+        + scale_b * np.outer(axis_b, axis_b)
     )
+    center_vec = np.array([float(cx), float(cy)], dtype=np.float64)
+    translation = center_vec - linear @ center_vec
+    affine = np.hstack([linear, translation.reshape(2, 1)]).astype(np.float32)
     rect = cv2.warpAffine(
-        rotated, S, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
+        bgr,
+        affine,
+        (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
     )
-    dbg["affine_scale_y"] = float(scale)
+    dbg["affine_scale_y"] = float(max(scale_a, scale_b))
+    dbg["affine_axis_scales"] = (scale_a, scale_b)
+    dbg["ellipse_rotation_skipped"] = False
     return rect, dbg
 
 
@@ -465,6 +488,11 @@ def _quality_from_debug(debug: Dict[str, object]) -> Tuple[float, List[str]]:
         score -= 0.10
         flags.append("white_outer_not_found")
 
+    sharpness = float(debug.get("image_sharpness", 999.0) or 0.0)
+    if sharpness < 85.0:
+        score -= 0.25
+        flags.append("image_blur")
+
     score = float(max(0.0, min(1.0, score)))
     if score < 0.55:
         flags.append("low_confidence")
@@ -496,6 +524,9 @@ def rectify_target(image_rgb: np.ndarray, out_size: int = CANON_SIZE) -> TargetR
         debug["midline_rotation_applied_deg"] = float(-mid_angle)
     else:
         debug["midline_rotation_applied_deg"] = 0.0
+
+    gray_rect3 = cv2.cvtColor(rect3, cv2.COLOR_BGR2GRAY)
+    debug["image_sharpness"] = float(cv2.Laplacian(gray_rect3, cv2.CV_64F).var())
 
     # after rotation, re-refine circle
     (ccx2, ccy2), rr2, dbg_circle2 = _refine_circle(rect3)
@@ -571,67 +602,166 @@ def transform_points(points_xy: List[Tuple[float, float]], M_2x3: np.ndarray) ->
     return [(float(x), float(y)) for x, y in out]
 
 
+def _radial_anomaly_candidates(
+    rect_bgr: np.ndarray,
+    center: Tuple[float, float],
+    outer_radius: float,
+    *,
+    allow_elongated_on_black: bool,
+) -> List[Tuple[float, float, float]]:
+    """Return ``(confidence, x, y)`` candidates after removing target structure.
+
+    A target face is radially repetitive: pixels at the same radius should have
+    similar color and brightness. Building that expected radial profile lets us
+    suppress rings and colored bands before looking for local arrow/hole
+    anomalies. This is intentionally conservative; missing a point is safer
+    than placing a confident-looking point on a printed ring.
+    """
+    h, w = rect_bgr.shape[:2]
+    cx, cy = float(center[0]), float(center[1])
+    radius = max(float(outer_radius), min(h, w) * 0.20)
+
+    yy, xx = np.indices((h, w), dtype=np.float32)
+    radial = np.hypot(xx - cx, yy - cy)
+    lab = cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2Lab).astype(np.float32)
+
+    bin_width = max(3.0, radius / 150.0)
+    radial_bin = np.floor(radial / bin_width).astype(np.int32)
+    bin_count = int(radial_bin.max()) + 1
+    flat_bins = radial_bin.ravel()
+    counts = np.bincount(flat_bins, minlength=bin_count).astype(np.float32)
+
+    light = lab[:, :, 0]
+    light_sums = np.bincount(
+        flat_bins,
+        weights=light.ravel(),
+        minlength=bin_count,
+    )
+    expected_light = (light_sums / np.maximum(counts, 1.0))[radial_bin]
+
+    light_delta = expected_light - light
+    absolute_light_delta = np.abs(light_delta)
+
+    ring_unit = radius / 10.0
+    ring_distance = np.abs((radial / ring_unit) - np.round(radial / ring_unit)) * ring_unit
+    away_from_printed_rings = ring_distance > max(5.0, radius * 0.012)
+    within_face = (radial < radius * 1.015) & (radial > max(9.0, radius * 0.02))
+
+    # Dark holes and carbon shafts on colored/white rings.
+    dark_anomaly = (expected_light > 58.0) & (light_delta > 27.0)
+    # On black rings only a bright shaft edge can be distinguished. Accepting
+    # compact bright marks there would mostly select printed digits.
+    black_ring_contrast = (expected_light <= 58.0) & (absolute_light_delta > 48.0)
+    anomaly_mask = (dark_anomaly | black_ring_contrast) & away_from_printed_rings & within_face
+    mask = anomaly_mask.astype(np.uint8) * 255
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+
+    num_labels, labels, stats, cents = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    candidates: List[Tuple[float, float, float]] = []
+    min_area = max(14, int(radius * radius * 0.00006))
+    max_area = max(800, int(radius * radius * 0.012))
+
+    for label in range(1, num_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        box_w = int(stats[label, cv2.CC_STAT_WIDTH])
+        box_h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        if area < min_area or area > max_area:
+            continue
+
+        ys, xs = np.where(labels == label)
+        if len(xs) < min_area:
+            continue
+        points = np.column_stack([xs.astype(np.float32), ys.astype(np.float32)])
+        centered = points - points.mean(axis=0)
+        covariance = (centered.T @ centered) / max(len(points) - 1, 1)
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        major_index = int(np.argmax(eigenvalues))
+        major_value = float(max(eigenvalues[major_index], 1e-6))
+        minor_value = float(max(eigenvalues[1 - major_index], 1e-6))
+        elongation = float((major_value / minor_value) ** 0.5)
+
+        component_expected_light = float(expected_light[ys, xs].mean())
+        is_black_ring_component = component_expected_light <= 58.0
+        if elongation >= 2.5 and not allow_elongated_on_black:
+            continue
+        if is_black_ring_component and (not allow_elongated_on_black or elongation < 3.0):
+            continue
+
+        component_mask = (labels == label).astype(np.uint8)
+        contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        perimeter = 0.0
+        if contours:
+            perimeter = float(cv2.arcLength(max(contours, key=cv2.contourArea), True))
+        circularity = float(4.0 * np.pi * area / max(perimeter * perimeter, 1.0))
+        aspect = float(max(box_w, box_h) / max(min(box_w, box_h), 1))
+
+        if elongation < 2.5 and (aspect > 2.8 or circularity < 0.22):
+            continue
+
+        if elongation >= 2.5 and max(box_w, box_h) >= 24:
+            direction = eigenvectors[:, major_index]
+            projection = points @ direction
+            low_point = points[int(np.argmin(projection))]
+            high_point = points[int(np.argmax(projection))]
+            low_distance = (low_point[0] - cx) ** 2 + (low_point[1] - cy) ** 2
+            high_distance = (high_point[0] - cx) ** 2 + (high_point[1] - cy) ** 2
+            candidate_xy = low_point if low_distance <= high_distance else high_point
+        else:
+            weights = np.maximum(light_delta[ys, xs], absolute_light_delta[ys, xs])
+            weights = np.maximum(weights, 1.0)
+            candidate_xy = np.array(
+                [np.average(xs, weights=weights), np.average(ys, weights=weights)],
+                dtype=np.float32,
+            )
+
+        anomaly_strength = float(absolute_light_delta[ys, xs].mean())
+        confidence = (
+            anomaly_strength
+            + min(area, 180) * 0.16
+            + min(circularity, 1.0) * 22.0
+            + min(elongation, 5.0) * (5.0 if elongation >= 2.5 else 0.0)
+        )
+        candidates.append((confidence, float(candidate_xy[0]), float(candidate_xy[1])))
+
+    return sorted(candidates, key=lambda item: item[0], reverse=True)
+
+
 def propose_hit_points(
     rect_bgr: np.ndarray,
     center_final: Tuple[float, float],
     arrow_present: bool,
     max_points: int = 12,
+    outer_radius: Optional[float] = None,
 ) -> List[Tuple[float, float]]:
     """
-    Candidate generation:
-    - if arrow_present: detect long line segments; use endpoint closer to center as 'tip-side' seed.
-    - else: blob candidates from Laplacian/OTSU.
+    Generate conservative hit candidates after subtracting the target's radial
+    ring/color structure. ``arrow_present`` only permits elongated contrast on
+    black rings; it no longer switches to an unvalidated global Hough search.
     """
     h, w = rect_bgr.shape[:2]
     cx, cy = center_final
-
-    gray = cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2GRAY)
-
-    pts: List[Tuple[float, float]] = []
-
-    if arrow_present:
-        edges = cv2.Canny(gray, 70, 160)
-        lines = cv2.HoughLinesP(
-            edges,
-            rho=1,
-            theta=np.pi / 180,
-            threshold=90,
-            minLineLength=int(min(h, w) * 0.18),
-            maxLineGap=12,
-        )
-        segments = normalize_hough_lines(lines)
-        if len(segments):
-            for x1, y1, x2, y2 in segments:
-                d1 = (x1 - cx) ** 2 + (y1 - cy) ** 2
-                d2 = (x2 - cx) ** 2 + (y2 - cy) ** 2
-                if d1 <= d2:
-                    pts.append((float(x1), float(y1)))
-                else:
-                    pts.append((float(x2), float(y2)))
-
-        pts = sorted(pts, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
-
-    if (not pts) or (not arrow_present):
-        g = cv2.GaussianBlur(gray, (0, 0), 1.2)
-        lap = cv2.Laplacian(g, cv2.CV_32F, ksize=3)
-        lap = np.abs(lap)
-        lap_u8 = cv2.normalize(lap, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        _, th = cv2.threshold(lap_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        th = cv2.medianBlur(th, 5)
-
-        num_labels, labels, stats, cents = cv2.connectedComponentsWithStats(th, connectivity=8)
-        for i in range(1, num_labels):
-            area = stats[i, cv2.CC_STAT_AREA]
-            if area < 40 or area > 5000:
-                continue
-            bx, by = cents[i]
-            pts.append((float(bx), float(by)))
-
-        pts = sorted(pts, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
+    radius = float(outer_radius) if outer_radius is not None else min(h, w) * 0.45
+    sharpness = float(cv2.Laplacian(cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var())
+    if sharpness < 85.0:
+        return []
+    ranked = _radial_anomaly_candidates(
+        rect_bgr,
+        (cx, cy),
+        radius,
+        allow_elongated_on_black=bool(arrow_present),
+    )
+    pts = [(x, y) for _, x, y in ranked]
 
     # de-dup quickly
     dedup: List[Tuple[float, float]] = []
-    min_d2 = 28.0 ** 2
+    # Close arrows are valid; the previous 28 px threshold merged separate
+    # holes in a tight gold group. Components have already removed duplicate
+    # edge pixels, so only collapse almost-identical centres here.
+    min_d2 = max(10.0, radius * 0.025) ** 2
     for p in pts:
         ok = True
         for q in dedup:
