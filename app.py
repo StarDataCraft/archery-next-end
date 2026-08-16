@@ -1,4 +1,5 @@
 # app.py
+# Deployment marker: visible-shaft recognition rollout (2026-08-16).
 import streamlit as st
 
 from src.state import init_state, goto_step
