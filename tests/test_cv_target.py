@@ -1,5 +1,6 @@
 import unittest
 from unittest.mock import patch
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -194,6 +195,45 @@ class HitCandidateAccuracyTests(unittest.TestCase):
 
         self.assertIn("image_blur", result.quality_flags)
         self.assertEqual(proposed.shape, (0,))
+
+    def test_worn_real_target_traces_current_shafts_instead_of_old_holes(self):
+        fixture = Path(__file__).parent / "fixtures" / "worn_target_five_arrows.jpg"
+        image = cv2.imread(str(fixture))
+        self.assertIsNotNone(image)
+
+        result = rectify_target(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        diagnostics = {}
+        proposed_rect = propose_hit_points(
+            result.rect_bgr,
+            result.center_final,
+            result.arrow_present,
+            max_points=12,
+            outer_radius=result.outer_radius,
+            diagnostics=diagnostics,
+        )
+        proposed = np.array(
+            transform_points(proposed_rect, result.M_rect_to_canon),
+            dtype=np.float32,
+        )
+        expected = np.array(
+            [
+                (366.8, 392.5),
+                (427.9, 406.1),
+                (351.0, 412.1),
+                (448.1, 522.1),
+                (625.3, 531.6),
+            ],
+            dtype=np.float32,
+        )
+
+        self.assertEqual(result.debug["rectify_mode"], "colored_target")
+        self.assertEqual(diagnostics["mode"], "visible_shafts")
+        self.assertEqual(len(proposed), len(expected))
+        nearest_errors = [
+            float(np.min(np.linalg.norm(proposed - point, axis=1)))
+            for point in expected
+        ]
+        self.assertLess(max(nearest_errors), 12.0)
 
 
 if __name__ == "__main__":

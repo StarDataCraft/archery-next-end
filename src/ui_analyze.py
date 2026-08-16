@@ -366,13 +366,25 @@ def render_analyze_step():
                     ring_line_thickness=2,
                 )
 
+                proposal_debug = {}
                 coarse = propose_hit_points(
                     rect_res.rect_bgr,
                     rect_res.center_final,
                     rect_res.arrow_present,
                     max_points=max(need, 12),
                     outer_radius=rect_res.outer_radius,
+                    diagnostics=proposal_debug,
                 )
+                rect_res.debug["hit_detection"] = proposal_debug
+
+                detected_count = None
+                if proposal_debug.get("mode") == "visible_shafts" and 3 <= len(coarse) <= 12:
+                    detected_count = len(coarse)
+                    # Visible shaft endpoints are direct current-arrow
+                    # evidence, so use their count instead of padding the end
+                    # with historical holes to match the previous setting.
+                    need = detected_count
+                    st.session_state.arrows_per_end = detected_count
 
                 # Radial-anomaly candidates are already weighted centroids or
                 # shaft endpoints. A second generic edge search can snap them
@@ -396,6 +408,8 @@ def render_analyze_step():
                 "score": float(rect_res.quality_score),
                 "flags": list(rect_res.quality_flags),
             }
+            st.session_state.cv_detection_mode = proposal_debug.get("mode")
+            st.session_state.detected_arrow_count = detected_count
         except Exception:
             logger.exception("Target photo analysis failed")
             reset_shot()
@@ -403,6 +417,12 @@ def render_analyze_step():
             st.error(t("cv_error", lang))
             st.caption(t("cv_error_hint", lang))
             return
+
+    if (
+        st.session_state.get("cv_detection_mode") == "visible_shafts"
+        and st.session_state.get("detected_arrow_count")
+    ):
+        need = int(st.session_state.detected_arrow_count)
 
     bg_rgb = st.session_state.overlay_image_rgb
     auto_pts = st.session_state.auto_points
@@ -416,6 +436,12 @@ def render_analyze_step():
     st.subheader(t("tap_points", lang))
     st.caption(t("mapped_target_hint", lang))
     quality_flags = set((quality or {}).get("flags", []) or [])
+    if st.session_state.get("cv_detection_mode") == "visible_shafts":
+        st.info(
+            t("detected_arrow_count", lang).format(
+                count=int(st.session_state.detected_arrow_count),
+            )
+        )
     if "image_blur" in quality_flags:
         st.warning(t("blur_warning", lang))
     elif quality is not None and float(quality.get("score", 1.0)) < 0.55:

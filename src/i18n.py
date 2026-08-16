@@ -63,6 +63,11 @@ TEXT = {
         "en": "Only {count} of {need} high-confidence candidates were kept. Click to add the rest.",
         "zh": "仅保留了 {count} / {need} 个高可信候选点；请点击补充其余点位。",
     },
+    "detected_arrow_count": {
+        "ja": "現在の矢のシャフトを {count} 本検出しました。この本数で分析します。",
+        "en": "Detected {count} current arrow shafts. The analysis will use this count.",
+        "zh": "检测到 {count} 支当前箭杆，将按这个数量进行分析。",
+    },
     "manual_points": {
         "ja": "着弾候補を検出できませんでした。的の上をクリックして位置を追加してください。",
         "en": "No hit candidates were found. Click the target to add the hit positions manually.",

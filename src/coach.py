@@ -616,29 +616,67 @@ def _alternative_hypotheses(lang: str, diagnosis: Dict[str, Any]) -> List[str]:
     return list(values[diagnosis["key"]].get(lang, values[diagnosis["key"]]["en"]))
 
 
-def _success_criterion(lang: str, diagnosis: Dict[str, Any]) -> str:
+def _adapt_arrow_count(text: str, lang: str, arrow_count: int) -> str:
+    """Adapt reviewed card wording to the current end's actual arrow count."""
+    arrow_count = max(1, int(arrow_count))
+    pass_count = max(1, arrow_count - 1)
+    if arrow_count == 6:
+        return text
+    replacements = {
+        "ja": [
+            ("6射中5射以上", f"{arrow_count}射中{pass_count}射以上"),
+            ("次の6射", f"次の{arrow_count}射"),
+            ("6射すべて", f"{arrow_count}射すべて"),
+            ("6射", f"{arrow_count}射"),
+        ],
+        "en": [
+            ("at least five of six shots", f"at least {pass_count} of {arrow_count} shots"),
+            ("At least five of six shots", f"At least {pass_count} of {arrow_count} shots"),
+            ("next six shots", f"next {arrow_count} shots"),
+            ("next six arrows", f"next {arrow_count} arrows"),
+            ("For all six shots", f"For all {arrow_count} shots"),
+            ("Six shots", f"{arrow_count} shots"),
+            ("six shots", f"{arrow_count} shots"),
+        ],
+        "zh": [
+            ("6箭中至少5箭", f"{arrow_count}箭中至少{pass_count}箭"),
+            ("至少 5/6 箭", f"至少 {pass_count}/{arrow_count} 箭"),
+            ("至少5/6箭", f"至少{pass_count}/{arrow_count}箭"),
+            ("下一组6箭", f"下一组{arrow_count}箭"),
+            ("连续6箭", f"连续{arrow_count}箭"),
+            ("6箭", f"{arrow_count}箭"),
+        ],
+    }
+    for source, target in replacements.get(lang, replacements["en"]):
+        text = text.replace(source, target)
+    return text
+
+
+def _success_criterion(lang: str, diagnosis: Dict[str, Any], arrow_count: int = 6) -> str:
+    arrow_count = max(1, int(arrow_count))
+    pass_count = max(1, arrow_count - 1)
     key = diagnosis["key"]
     if key == "single_outlier":
         return _text(lang, {
-            "ja": "次の6射で5射以上を○にし、単独でコア半径の2倍以上離れる矢を0本にする。",
-            "en": "Grade at least five of six shots as pass, with no arrow landing more than 2× the core radius alone.",
-            "zh": "下一组至少 5/6 箭动作通过，并且没有单箭独自偏离核心半径 2 倍以上。",
+            "ja": f"次の{arrow_count}射で{pass_count}射以上を○にし、単独でコア半径の2倍以上離れる矢を0本にする。",
+            "en": f"Grade at least {pass_count} of {arrow_count} shots as pass, with no arrow landing more than 2× the core radius alone.",
+            "zh": f"下一组至少 {pass_count}/{arrow_count} 箭动作通过，并且没有单箭独自偏离核心半径 2 倍以上。",
         })
     if key in {"horizontal", "vertical"}:
         ratio = diagnosis["anisotropy"]
         axis = _text(lang, {"ja": "横/縦比" if key == "horizontal" else "縦/横比", "en": "horizontal/vertical ratio" if key == "horizontal" else "vertical/horizontal ratio", "zh": "横纵比" if key == "horizontal" else "纵横比"})
         return _text(lang, {
-            "ja": f"次の6射で{axis}を現在の{ratio:.1f}から15%以上下げるか、1.5以下にする。平均点は0.5点以上落とさない。",
-            "en": f"On the next six arrows, reduce the {axis} by at least 15% from {ratio:.1f}, or bring it to 1.5 or less, without losing more than 0.5 average points.",
+            "ja": f"次の{arrow_count}射で{axis}を現在の{ratio:.1f}から15%以上下げるか、1.5以下にする。平均点は0.5点以上落とさない。",
+            "en": f"On the next {arrow_count} arrows, reduce the {axis} by at least 15% from {ratio:.1f}, or bring it to 1.5 or less, without losing more than 0.5 average points.",
             "zh": f"下一组把{axis}从当前 {ratio:.1f} 降低至少 15%，或降到 1.5 以下；平均分下降不超过 0.5。",
         })
     if key == "loose":
         current = diagnosis["core_spread_ratio"] * 100
         target = current * 0.85
         return _text(lang, {
-            "ja": f"次の6射でコア散布を外径の{current:.1f}%から{target:.1f}%以下へ縮め、5射以上を同じ終了姿勢にする。",
-            "en": f"Reduce core spread from {current:.1f}% to {target:.1f}% of target radius or less, with at least five matching finishes.",
-            "zh": f"下一组把核心散布从靶半径的 {current:.1f}% 降到 {target:.1f}% 以下，并至少有 5 箭结束姿势一致。",
+            "ja": f"次の{arrow_count}射でコア散布を外径の{current:.1f}%から{target:.1f}%以下へ縮め、{pass_count}射以上を同じ終了姿勢にする。",
+            "en": f"Reduce core spread from {current:.1f}% to {target:.1f}% of target radius or less, with at least {pass_count} matching finishes.",
+            "zh": f"下一组把核心散布从靶半径的 {current:.1f}% 降到 {target:.1f}% 以下，并至少有 {pass_count} 箭结束姿势一致。",
         })
     if key == "tight_offset":
         offset = diagnosis["offset_ratio"] * 100
@@ -652,15 +690,15 @@ def _success_criterion(lang: str, diagnosis: Dict[str, Any]) -> str:
     if key == "protect":
         limit = diagnosis["spread_ratio"] * 110
         return _text(lang, {
-            "ja": f"6射中5射以上で同じ合図を守り、広がりを外径の{limit:.1f}%以内に保つ。",
-            "en": f"Keep the cue on at least five of six shots and hold spread within {limit:.1f}% of target radius.",
-            "zh": f"至少 5/6 箭守住同一口令，并把散布维持在靶半径的 {limit:.1f}% 以内。",
+            "ja": f"{arrow_count}射中{pass_count}射以上で同じ合図を守り、広がりを外径の{limit:.1f}%以内に保つ。",
+            "en": f"Keep the cue on at least {pass_count} of {arrow_count} shots and hold spread within {limit:.1f}% of target radius.",
+            "zh": f"至少 {pass_count}/{arrow_count} 箭守住同一口令，并把散布维持在靶半径的 {limit:.1f}% 以内。",
         })
     target = diagnosis["spread_ratio"] * 90
     return _text(lang, {
-        "ja": f"6射中5射以上で基準を再現し、広がりを外径の{target:.1f}%以下へ縮める。",
-        "en": f"Repeat the reference on at least five of six shots and reduce spread to {target:.1f}% of target radius or less.",
-        "zh": f"至少 5/6 箭重复同一参考点，并把散布降到靶半径的 {target:.1f}% 以下。",
+        "ja": f"{arrow_count}射中{pass_count}射以上で基準を再現し、広がりを外径の{target:.1f}%以下へ縮める。",
+        "en": f"Repeat the reference on at least {pass_count} of {arrow_count} shots and reduce spread to {target:.1f}% of target radius or less.",
+        "zh": f"至少 {pass_count}/{arrow_count} 箭重复同一参考点，并把散布降到靶半径的 {target:.1f}% 以下。",
     })
 
 
@@ -797,10 +835,23 @@ class CoachRAG:
         session_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if self.cfg.mode == "rules":
-            return dict(base_advice)
+            arrow_count = max(1, int(metrics.get("n", 6) or 6))
+            out = dict(base_advice)
+            for key in ("title", "single_cue", "pass_fail", "fallback", "why"):
+                if isinstance(out.get(key), str):
+                    out[key] = _adapt_arrow_count(out[key], lang, arrow_count)
+            if isinstance(out.get("drill"), dict):
+                out["drill"] = dict(out["drill"])
+                for key in ("name", "how"):
+                    if isinstance(out["drill"].get(key), str):
+                        out["drill"][key] = _adapt_arrow_count(
+                            out["drill"][key], lang, arrow_count
+                        )
+            return out
 
         comparable_log = _comparable_log(log, session_context)
         diagnosis = _diagnose(metrics, shape, scoring)
+        arrow_count = max(1, int(diagnosis.get("n", 6) or 6))
         recent_diagnoses = _recent_diagnoses(comparable_log)
         repeated = bool(recent_diagnoses and recent_diagnoses[0] == diagnosis["key"])
         trend = _trend(lang, diagnosis, _last_metrics(comparable_log))
@@ -812,10 +863,11 @@ class CoachRAG:
             card_id = "anchor_balance"
 
         card = BOOK_CARDS[card_id]
-        cue = _text(lang, card["cue"])
-        pass_fail = _text(lang, card["pass_fail"])
-        fallback = _text(lang, card["fallback"])
-        drill_name = _text(lang, card["drill_name"])
+        cue = _adapt_arrow_count(_text(lang, card["cue"]), lang, arrow_count)
+        pass_fail = _adapt_arrow_count(_text(lang, card["pass_fail"]), lang, arrow_count)
+        fallback = _adapt_arrow_count(_text(lang, card["fallback"]), lang, arrow_count)
+        drill_name = _adapt_arrow_count(_text(lang, card["drill_name"]), lang, arrow_count)
+        drill_how = _adapt_arrow_count(_text(lang, card["drill_how"]), lang, arrow_count)
         source = _localized_source(card, lang, self.cfg.pdf_path)
         confidence = _confidence(lang, diagnosis, quality, repeated, self_report)
         self_report_label = _text(lang, SELF_REPORT_LABELS.get(self_report, SELF_REPORT_LABELS["none"]))
@@ -828,7 +880,7 @@ class CoachRAG:
             "pass_fail": pass_fail,
             "fallback": fallback,
             "why": _text(lang, card["why"]),
-            "drill": {"name": drill_name, "how": _text(lang, card["drill_how"]), "duration_s": card["duration_s"]},
+            "drill": {"name": drill_name, "how": drill_how, "duration_s": card["duration_s"]},
             "mental_phrase": _text(lang, card["mental"]),
             "stage": card["stage"],
             "tag": card_id,
@@ -846,7 +898,7 @@ class CoachRAG:
                 "self_report_label": self_report_label,
             },
             "feedback": {
-                "success_criterion": _success_criterion(lang, diagnosis),
+                "success_criterion": _success_criterion(lang, diagnosis, arrow_count),
                 "alternative_hypotheses": _alternative_hypotheses(lang, diagnosis),
                 "do_not_change": _do_not_change(lang, diagnosis),
                 "selected_by": "self_report" if self_report in SELF_REPORT_CARD else "group_pattern",

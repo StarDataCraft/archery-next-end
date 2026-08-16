@@ -34,6 +34,7 @@ class TargetRectifyResult:
 CANON_SIZE = 900
 CANON_CENTER = (CANON_SIZE / 2.0, CANON_SIZE / 2.0)
 CANON_OUTER = CANON_SIZE * 0.45  # 405
+MIN_IMAGE_SHARPNESS = 90.0
 
 
 def _rgb_to_bgr(rgb: np.ndarray) -> np.ndarray:
@@ -45,6 +46,140 @@ def _largest_contour(edge: np.ndarray) -> Optional[np.ndarray]:
     if not contours:
         return None
     return max(contours, key=cv2.contourArea)
+
+
+def _odd_kernel(value: float, minimum: int = 3) -> int:
+    size = max(int(minimum), int(round(float(value))))
+    return size if size % 2 == 1 else size + 1
+
+
+def _fit_colored_target_ellipse(
+    bgr: np.ndarray,
+) -> Tuple[Optional[Tuple[Tuple[float, float], Tuple[float, float], float]], Dict[str, object]]:
+    """Fit the outer red scoring-zone boundary.
+
+    The red zone is a much safer target reference than the largest edge
+    contour: arrows, fletchings and the edge of the backing board can all be
+    larger than a partially framed target face. On a WA-style face the outer
+    red boundary is 40% of the full scoring radius, so one fitted ellipse gives
+    both the target centre and the canonical scale.
+    """
+    h, w = bgr.shape[:2]
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    hue, sat, val = cv2.split(hsv)
+    red = (((hue < 16) | (hue > 170)) & (sat > 70) & (val > 50)).astype(np.uint8) * 255
+
+    close_size = _odd_kernel(min(h, w) * 0.016, 9)
+    open_size = _odd_kernel(min(h, w) * 0.005, 3)
+    red = cv2.morphologyEx(
+        red,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_size, close_size)),
+    )
+    red = cv2.morphologyEx(
+        red,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_size, open_size)),
+    )
+
+    contours, _ = cv2.findContours(red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    dbg: Dict[str, object] = {
+        "color_ring_found": False,
+        "color_ring_mask_ratio": float(red.mean() / 255.0),
+    }
+    if not contours:
+        dbg["fallback"] = "no_red_contour"
+        return None, dbg
+
+    contour = max(contours, key=cv2.contourArea)
+    area_ratio = float(cv2.contourArea(contour) / max(h * w, 1))
+    dbg["color_ring_contour_area_ratio"] = area_ratio
+    if len(contour) < 20 or area_ratio < 0.025:
+        dbg["fallback"] = "red_contour_too_small"
+        return None, dbg
+
+    ellipse = cv2.fitEllipse(contour)
+    (cx, cy), (axis_a, axis_b), angle = ellipse
+    minor = min(float(axis_a), float(axis_b))
+    major = max(float(axis_a), float(axis_b))
+    if minor < min(h, w) * 0.18 or major > max(h, w) * 1.65:
+        dbg["fallback"] = "red_ellipse_implausible"
+        return None, dbg
+    if not (-0.15 * w <= cx <= 1.15 * w and -0.15 * h <= cy <= 1.15 * h):
+        dbg["fallback"] = "red_ellipse_center_outside"
+        return None, dbg
+
+    points = contour[:, 0, :].astype(np.float64)
+    theta = np.deg2rad(float(angle))
+    axis_u = np.array([np.cos(theta), np.sin(theta)], dtype=np.float64)
+    axis_v = np.array([-np.sin(theta), np.cos(theta)], dtype=np.float64)
+    centered = points - np.array([cx, cy], dtype=np.float64)
+    normalized_radius = np.sqrt(
+        (centered @ axis_u / max(float(axis_a) / 2.0, 1e-6)) ** 2
+        + (centered @ axis_v / max(float(axis_b) / 2.0, 1e-6)) ** 2
+    )
+    fit_error_p90 = float(np.percentile(np.abs(normalized_radius - 1.0), 90))
+    if fit_error_p90 > 0.38:
+        dbg.update({"fallback": "red_ellipse_fit_error", "color_ring_fit_error_p90": fit_error_p90})
+        return None, dbg
+
+    dbg.update(
+        {
+            "color_ring_found": True,
+            "color_ring_center": (float(cx), float(cy)),
+            "color_ring_axes": (float(axis_a), float(axis_b)),
+            "color_ring_angle": float(angle),
+            "color_ring_fit_error_p90": fit_error_p90,
+        }
+    )
+    return ellipse, dbg
+
+
+def _rectify_by_colored_target(
+    bgr: np.ndarray,
+    out_size: int,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Dict[str, object]]:
+    ellipse, dbg = _fit_colored_target_ellipse(bgr)
+    if ellipse is None:
+        return None, None, dbg
+
+    (cx, cy), (axis_a, axis_b), angle = ellipse
+    target_center = np.array([out_size / 2.0, out_size / 2.0], dtype=np.float64)
+    target_outer = float(out_size) * 0.45
+    target_red_radius = target_outer * 0.40
+
+    theta = np.deg2rad(float(angle))
+    axis_u = np.array([np.cos(theta), np.sin(theta)], dtype=np.float64)
+    axis_v = np.array([-np.sin(theta), np.cos(theta)], dtype=np.float64)
+    linear = (
+        (target_red_radius / max(float(axis_a) / 2.0, 1e-6)) * np.outer(axis_u, axis_u)
+        + (target_red_radius / max(float(axis_b) / 2.0, 1e-6)) * np.outer(axis_v, axis_v)
+    )
+    source_center = np.array([float(cx), float(cy)], dtype=np.float64)
+    translation = target_center - linear @ source_center
+    source_to_rect = np.hstack([linear, translation.reshape(2, 1)]).astype(np.float32)
+
+    rect = cv2.warpAffine(
+        bgr,
+        source_to_rect,
+        (out_size, out_size),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(30, 30, 30),
+    )
+    dbg.update(
+        {
+            "rectify_mode": "colored_target",
+            "source_to_rect": source_to_rect.tolist(),
+            "ellipse_found": True,
+            "ellipse_center": (float(cx), float(cy)),
+            "ellipse_axes": (float(axis_a), float(axis_b)),
+            "ellipse_angle": float(angle),
+            "ellipse_axis_ratio": float(max(axis_a, axis_b) / max(min(axis_a, axis_b), 1e-6)),
+            "ellipse_rotation_skipped": abs(float(axis_a) - float(axis_b)) < 0.03 * max(axis_a, axis_b),
+        }
+    )
+    return rect, source_to_rect, dbg
 
 
 def _affine_rectify_by_ellipse(bgr: np.ndarray) -> Tuple[np.ndarray, Dict[str, object]]:
@@ -489,7 +624,7 @@ def _quality_from_debug(debug: Dict[str, object]) -> Tuple[float, List[str]]:
         flags.append("white_outer_not_found")
 
     sharpness = float(debug.get("image_sharpness", 999.0) or 0.0)
-    if sharpness < 85.0:
+    if sharpness < MIN_IMAGE_SHARPNESS:
         score -= 0.25
         flags.append("image_blur")
 
@@ -501,6 +636,57 @@ def _quality_from_debug(debug: Dict[str, object]) -> Tuple[float, List[str]]:
 
 def rectify_target(image_rgb: np.ndarray, out_size: int = CANON_SIZE) -> TargetRectifyResult:
     bgr = _rgb_to_bgr(image_rgb)
+
+    # Prefer the known color geometry when the red scoring zone is visible.
+    # This path remains stable even when the outer face is cropped and arrows
+    # or backing-board edges are the largest contours in the photograph.
+    color_rect, _, color_debug = _rectify_by_colored_target(bgr, out_size)
+    if color_rect is not None:
+        center = (out_size / 2.0, out_size / 2.0)
+        outer_radius = float(out_size) * 0.45
+        arrow_present, line_count = _detect_arrow_present(color_rect)
+        sharpness = float(
+            cv2.Laplacian(
+                cv2.cvtColor(color_rect, cv2.COLOR_BGR2GRAY),
+                cv2.CV_64F,
+            ).var()
+        )
+        color_debug.update(
+            {
+                "arrow_present": arrow_present,
+                "line_count": int(line_count),
+                "image_sharpness": sharpness,
+                "center_final_source": "color_ring",
+                "outer_radius_source": "red_zone_ratio",
+            }
+        )
+
+        fit_error = float(color_debug.get("color_ring_fit_error_p90", 0.0) or 0.0)
+        quality_score = float(max(0.0, min(1.0, 0.97 - fit_error * 0.15)))
+        quality_flags: List[str] = []
+        if fit_error > 0.32:
+            quality_score -= 0.12
+            quality_flags.append("color_ring_fit_uncertain")
+        if sharpness < MIN_IMAGE_SHARPNESS:
+            quality_score -= 0.25
+            quality_flags.append("image_blur")
+        quality_score = float(max(0.0, min(1.0, quality_score)))
+        if quality_score < 0.55:
+            quality_flags.append("low_confidence")
+
+        return TargetRectifyResult(
+            rect_bgr=color_rect,
+            circle_center=center,
+            outer_radius=outer_radius,
+            midline_y=None,
+            x_center=center,
+            center_final=center,
+            M_rect_to_canon=_build_similarity_M(center, outer_radius),
+            arrow_present=arrow_present,
+            debug=color_debug,
+            quality_score=quality_score,
+            quality_flags=quality_flags,
+        )
 
     rect1, dbg1 = _affine_rectify_by_ellipse(bgr)
     (cx, cy), r, dbg2 = _refine_circle(rect1)
@@ -600,6 +786,452 @@ def transform_points(points_xy: List[Tuple[float, float]], M_2x3: np.ndarray) ->
     pts = np.array(points_xy, dtype=np.float32).reshape(-1, 1, 2)
     out = cv2.transform(pts, M_2x3).reshape(-1, 2)
     return [(float(x), float(y)) for x, y in out]
+
+
+def _purple_fletch_groups(
+    rect_bgr: np.ndarray,
+    center: Tuple[float, float],
+    outer_radius: float,
+) -> Tuple[np.ndarray, List[Dict[str, object]]]:
+    """Group the distinctive purple/magenta vanes visible around arrow shafts."""
+    hsv = cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2HSV)
+    fletch_mask = cv2.inRange(
+        hsv,
+        np.array([135, 70, 35], dtype=np.uint8),
+        np.array([179, 255, 255], dtype=np.uint8),
+    )
+    fletch_mask = cv2.morphologyEx(
+        fletch_mask,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+
+    join_size = _odd_kernel(float(outer_radius) * 0.075, 15)
+    joined = cv2.dilate(
+        fletch_mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (join_size, join_size)),
+    )
+    label_count, labels, stats, _ = cv2.connectedComponentsWithStats(joined, connectivity=8)
+
+    cx, cy = float(center[0]), float(center[1])
+    min_area = max(180, int(float(outer_radius) ** 2 * 0.0010))
+    groups: List[Dict[str, object]] = []
+    for label in range(1, label_count):
+        if int(stats[label, cv2.CC_STAT_AREA]) < min_area:
+            continue
+        component = (labels == label) & (fletch_mask > 0)
+        ys, xs = np.where(component)
+        if len(xs) < min_area:
+            continue
+        group_center = np.array([float(xs.mean()), float(ys.mean())], dtype=np.float64)
+        if np.linalg.norm(group_center - np.array([cx, cy])) > float(outer_radius) * 1.55:
+            continue
+        component_mask = np.zeros_like(fletch_mask)
+        component_mask[ys, xs] = 255
+        groups.append(
+            {
+                "center": group_center,
+                "area": int(len(xs)),
+                "mask": component_mask,
+            }
+        )
+
+    groups.sort(key=lambda item: int(item["area"]), reverse=True)
+    return fletch_mask, groups[:12]
+
+
+def _fletch_angle_candidates(component_mask: np.ndarray) -> List[Tuple[float, float]]:
+    ys, xs = np.where(component_mask > 0)
+    if len(xs) < 20:
+        return []
+    margin = 15
+    x1 = max(0, int(xs.min()) - margin)
+    y1 = max(0, int(ys.min()) - margin)
+    x2 = min(component_mask.shape[1], int(xs.max()) + margin + 1)
+    y2 = min(component_mask.shape[0], int(ys.max()) + margin + 1)
+    roi = component_mask[y1:y2, x1:x2]
+    edges = cv2.Canny(roi, 30, 100)
+    min_length = max(12, int(min(roi.shape[:2]) * 0.18))
+    lines = normalize_hough_lines(
+        cv2.HoughLinesP(
+            edges,
+            rho=1,
+            theta=np.pi / 360.0,
+            threshold=max(10, int(min(roi.shape[:2]) * 0.10)),
+            minLineLength=min_length,
+            maxLineGap=max(8, int(min(roi.shape[:2]) * 0.12)),
+        )
+    )
+
+    histogram = np.zeros(90, dtype=np.float64)
+    for x_start, y_start, x_end, y_end in lines:
+        dx = float(x_end - x_start)
+        dy = float(y_end - y_start)
+        length = float(np.hypot(dx, dy))
+        angle = float(np.degrees(np.arctan2(dy, dx)) % 180.0)
+        histogram[int(round(angle / 2.0)) % 90] += length
+
+    peaks: List[Tuple[float, float]] = []
+    for index, weight in enumerate(histogram):
+        if weight < 10.0:
+            continue
+        if weight >= histogram[(index - 1) % 90] and weight >= histogram[(index + 1) % 90]:
+            peaks.append((float(weight), float((index * 2) % 180)))
+
+    if not peaks:
+        points = np.column_stack([xs.astype(np.float64), ys.astype(np.float64)])
+        covariance = np.cov(points.T)
+        values, vectors = np.linalg.eigh(covariance)
+        direction = vectors[:, int(np.argmax(values))]
+        angle = float(np.degrees(np.arctan2(direction[1], direction[0])) % 180.0)
+        return [(1.0, angle)]
+    return sorted(peaks, reverse=True)[:3]
+
+
+def _dark_shaft_chain(
+    lightness: np.ndarray,
+    group_center: np.ndarray,
+    angle_deg: float,
+    target_center: Tuple[float, float],
+    outer_radius: float,
+    *,
+    reverse: bool = False,
+) -> Dict[str, object]:
+    """Trace a dark shaft from its fletching toward its target endpoint."""
+    h, w = lightness.shape[:2]
+    target = np.array(target_center, dtype=np.float64)
+    theta = np.deg2rad(float(angle_deg))
+    direction = np.array([np.cos(theta), np.sin(theta)], dtype=np.float64)
+    if float(direction @ (target - group_center)) < 0.0:
+        direction *= -1.0
+    if reverse:
+        direction *= -1.0
+    normal = np.array([-direction[1], direction[0]], dtype=np.float64)
+
+    max_steps = max(120, int(float(outer_radius) * 1.42))
+    flank_outer = max(16, int(round(float(outer_radius) * 0.062)))
+    flank_inner = max(10, int(round(float(outer_radius) * 0.037)))
+    center_half = max(3, int(round(float(outer_radius) * 0.012)))
+    offsets = np.arange(-flank_outer, flank_outer + 1, dtype=np.float32)
+    steps = np.arange(max_steps, dtype=np.float32)
+    map_x = (
+        float(group_center[0])
+        + steps[:, None] * float(direction[0])
+        + offsets[None, :] * float(normal[0])
+    ).astype(np.float32)
+    map_y = (
+        float(group_center[1])
+        + steps[:, None] * float(direction[1])
+        + offsets[None, :] * float(normal[1])
+    ).astype(np.float32)
+    strip = cv2.remap(
+        lightness.astype(np.float32),
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+
+    center_selector = np.abs(offsets) <= center_half
+    left_selector = (offsets >= -flank_outer) & (offsets <= -flank_inner)
+    right_selector = (offsets >= flank_inner) & (offsets <= flank_outer)
+    center_light = strip[:, center_selector].mean(axis=1)
+    flank_light = (strip[:, left_selector].mean(axis=1) + strip[:, right_selector].mean(axis=1)) / 2.0
+    darkness = np.maximum(0.0, flank_light - center_light)
+
+    median_radius = max(3, int(round(float(outer_radius) * 0.02)))
+    smoothed = np.array(
+        [
+            float(np.median(darkness[max(0, i - median_radius) : min(max_steps, i + median_radius + 1)]))
+            for i in range(max_steps)
+        ],
+        dtype=np.float32,
+    )
+    evidence = smoothed > 8.0
+    minimum_run = max(8, int(round(float(outer_radius) * 0.02)))
+    runs: List[Tuple[int, int, int]] = []
+    start: Optional[int] = None
+    for index, present in enumerate(np.append(evidence, False)):
+        if bool(present) and start is None:
+            start = index
+        elif not bool(present) and start is not None:
+            if index - start >= minimum_run:
+                runs.append((start, index - 1, index - start))
+            start = None
+
+    maximum_gap = max(24, int(round(float(outer_radius) * 0.09)))
+    chains: List[List[Tuple[int, int, int]]] = []
+    for run in runs:
+        gap = run[0] - chains[-1][-1][1] - 1 if chains else maximum_gap + 1
+        if not chains or gap > maximum_gap:
+            chains.append([run])
+        else:
+            chains[-1].append(run)
+
+    if not chains:
+        return {
+            "span": 0,
+            "end": 0,
+            "mean_darkness": 0.0,
+            "direction": direction,
+            "angle": float(angle_deg % 180.0),
+        }
+
+    best_chain = max(
+        chains,
+        key=lambda chain: (chain[-1][1] - chain[0][0] + 1, sum(run[2] for run in chain)),
+    )
+    chain_start = int(best_chain[0][0])
+    chain_end = int(best_chain[-1][1])
+    span = int(chain_end - chain_start + 1)
+    mean_darkness = float(smoothed[chain_start : chain_end + 1].mean())
+    endpoint = group_center + direction * float(chain_end)
+    if not (0 <= endpoint[0] < w and 0 <= endpoint[1] < h):
+        span = 0
+
+    return {
+        "span": span,
+        "start": chain_start,
+        "end": chain_end,
+        "mean_darkness": mean_darkness,
+        "direction": direction,
+        "angle": float(angle_deg % 180.0),
+    }
+
+
+def _fletched_shaft_candidates(
+    rect_bgr: np.ndarray,
+    center: Tuple[float, float],
+    outer_radius: float,
+) -> Tuple[List[Tuple[float, float, float]], List[Dict[str, object]]]:
+    _, groups = _purple_fletch_groups(rect_bgr, center, outer_radius)
+    if not groups:
+        return [], []
+
+    lightness = cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2Lab)[:, :, 0].astype(np.float32)
+    candidates: List[Tuple[float, float, float]] = []
+    accepted_groups: List[Dict[str, object]] = []
+    target = np.array(center, dtype=np.float64)
+
+    def trace(group_center: np.ndarray, angle: float) -> Dict[str, object]:
+        directions = [
+            _dark_shaft_chain(
+                lightness,
+                group_center,
+                angle,
+                center,
+                outer_radius,
+                reverse=reverse,
+            )
+            for reverse in (False, True)
+        ]
+        maximum_span = max(int(result["span"]) for result in directions)
+        eligible = [
+            result
+            for result in directions
+            if int(result["span"]) >= max(1, int(maximum_span * 0.85))
+        ]
+
+        def endpoint_texture(result: Dict[str, object]) -> float:
+            endpoint = group_center + result["direction"] * float(result["end"])
+            x = int(round(float(endpoint[0])))
+            y = int(round(float(endpoint[1])))
+            radius = max(12, int(round(float(outer_radius) * 0.05)))
+            roi = lightness[
+                max(0, y - radius) : min(lightness.shape[0], y + radius + 1),
+                max(0, x - radius) : min(lightness.shape[1], x + radius + 1),
+            ]
+            return float(roi.std()) if roi.size else 999.0
+
+        # When the fletching lies over the target centre, both directions can
+        # have similar trace lengths. The nock is a large blurred dark object;
+        # the embedded point is the narrower, less textured endpoint.
+        return min(
+            eligible,
+            key=lambda result: (endpoint_texture(result), -int(result["span"])),
+        )
+
+    def trace_score(result: Dict[str, object], hough_weight: float = 1.0) -> float:
+        endpoint = result["group_center"] + result["direction"] * float(result["end"])
+        endpoint_radius = float(np.linalg.norm(endpoint - target))
+        radial_factor = max(0.15, 1.0 - endpoint_radius / max(float(outer_radius) * 1.05, 1e-6))
+        return (
+            float(result["span"]) ** 1.5
+            * float(np.sqrt(float(result["mean_darkness"]) + 1.0))
+            * radial_factor
+            * float(np.sqrt(max(hough_weight, 1.0)))
+        )
+
+    for group in groups:
+        angle_peaks = _fletch_angle_candidates(group["mask"])
+        if not angle_peaks:
+            continue
+        base_results = []
+        for hough_weight, angle in angle_peaks:
+            result = trace(group["center"], angle)
+            result["group_center"] = group["center"]
+            base_results.append((result, hough_weight))
+        base, _ = max(
+            base_results,
+            key=lambda item: trace_score(item[0], item[1]),
+        )
+        if int(base["span"]) < max(45, int(float(outer_radius) * 0.11)):
+            continue
+
+        refined_results = []
+        for offset in np.arange(-4.0, 4.01, 0.5):
+            result = trace(group["center"], (float(base["angle"]) + offset) % 180.0)
+            result["group_center"] = group["center"]
+            refined_results.append(result)
+        refined = max(
+            refined_results,
+            key=trace_score,
+        )
+        endpoint = group["center"] + refined["direction"] * float(refined["end"])
+        if np.linalg.norm(endpoint - target) > float(outer_radius) * 1.05:
+            continue
+        confidence = float(refined["span"]) * float(np.sqrt(float(refined["mean_darkness"]) + 1.0))
+        candidates.append((confidence, float(endpoint[0]), float(endpoint[1])))
+        accepted = dict(group)
+        accepted.update({"shaft_angle": float(refined["angle"]), "shaft_endpoint": endpoint})
+        accepted_groups.append(accepted)
+
+    return sorted(candidates, reverse=True), accepted_groups
+
+
+def _unfletched_shaft_candidates(
+    rect_bgr: np.ndarray,
+    center: Tuple[float, float],
+    outer_radius: float,
+    fletch_groups: List[Dict[str, object]],
+) -> List[Tuple[float, float, float]]:
+    """Find long parallel shaft edges when the fletching is outside the frame."""
+    gray = cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 1.0), 50, 140)
+    lines = normalize_hough_lines(
+        cv2.HoughLinesP(
+            edges,
+            rho=1,
+            theta=np.pi / 360.0,
+            threshold=max(40, int(float(outer_radius) * 0.12)),
+            minLineLength=max(80, int(float(outer_radius) * 0.32)),
+            maxLineGap=max(20, int(float(outer_radius) * 0.085)),
+        )
+    )
+    target = np.array(center, dtype=np.float64)
+    raw: List[Dict[str, object]] = []
+
+    for segment in lines:
+        start = segment[:2].astype(np.float64)
+        end = segment[2:].astype(np.float64)
+        vector = end - start
+        length = float(np.linalg.norm(vector))
+        if length < float(outer_radius) * 0.32:
+            continue
+        start_radius = float(np.linalg.norm(start - target))
+        end_radius = float(np.linalg.norm(end - target))
+        radial_span = abs(start_radius - end_radius)
+        if min(start_radius, end_radius) > float(outer_radius) * 1.02:
+            continue
+        if max(start_radius, end_radius) > float(outer_radius) * 1.07:
+            continue
+        if radial_span < float(outer_radius) * 0.20:
+            continue
+
+        overlaps_fletch = False
+        for group in fletch_groups:
+            point = group["center"]
+            distance = abs(
+                vector[0] * (point[1] - start[1])
+                - vector[1] * (point[0] - start[0])
+            ) / max(length, 1e-6)
+            projection = float((point - start) @ vector / max(length * length, 1e-6))
+            if distance < float(outer_radius) * 0.16 and -0.4 < projection < 1.4:
+                overlaps_fletch = True
+                break
+        if overlaps_fletch:
+            continue
+
+        tip = start if start_radius <= end_radius else end
+        angle = float(np.degrees(np.arctan2(vector[1], vector[0])) % 180.0)
+        raw.append(
+            {
+                "angle": angle,
+                "tip": tip,
+                "length": length,
+                "radial_span": radial_span,
+            }
+        )
+
+    clusters: List[Dict[str, object]] = []
+    for item in sorted(raw, key=lambda value: float(value["length"]), reverse=True):
+        matched = None
+        for cluster in clusters:
+            angle_delta = abs(float(item["angle"]) - float(cluster["angle"]))
+            angle_delta = min(angle_delta, 180.0 - angle_delta)
+            tip_delta = float(np.linalg.norm(item["tip"] - cluster["tip"]))
+            if angle_delta <= 3.0 and tip_delta <= float(outer_radius) * 0.055:
+                matched = cluster
+                break
+        if matched is None:
+            clusters.append(
+                {
+                    "angle": float(item["angle"]),
+                    "tip": item["tip"].copy(),
+                    "items": [item],
+                }
+            )
+            continue
+        matched["items"].append(item)
+        total_length = sum(float(value["length"]) for value in matched["items"])
+        matched["angle"] = sum(
+            float(value["angle"]) * float(value["length"])
+            for value in matched["items"]
+        ) / max(total_length, 1e-6)
+        matched["tip"] = sum(
+            (value["tip"] * float(value["length"]) for value in matched["items"]),
+            np.zeros(2, dtype=np.float64),
+        ) / max(total_length, 1e-6)
+
+    ranked: List[Tuple[float, float, float]] = []
+    for cluster in clusters:
+        items = cluster["items"]
+        if len(items) < 2:
+            continue
+        score = (
+            len(items) * float(np.median([value["radial_span"] for value in items]))
+            + 0.15 * sum(float(value["length"]) for value in items)
+        )
+        tip = cluster["tip"]
+        ranked.append((float(score), float(tip[0]), float(tip[1])))
+
+    ranked.sort(reverse=True)
+    if not ranked:
+        return []
+    best_score = ranked[0][0]
+    threshold = max(float(outer_radius) * 1.10, best_score * 0.72)
+    return [candidate for candidate in ranked if candidate[0] >= threshold]
+
+
+def _shaft_hit_candidates(
+    rect_bgr: np.ndarray,
+    center: Tuple[float, float],
+    outer_radius: float,
+) -> Tuple[List[Tuple[float, float]], bool]:
+    fletched, groups = _fletched_shaft_candidates(rect_bgr, center, outer_radius)
+    extra = _unfletched_shaft_candidates(rect_bgr, center, outer_radius, groups)
+    shaft_mode = bool(groups or extra)
+    ranked = list(fletched) + list(extra)
+    ranked.sort(reverse=True)
+
+    points: List[Tuple[float, float]] = []
+    minimum_distance_sq = max(14.0, float(outer_radius) * 0.04) ** 2
+    for _, x, y in ranked:
+        if any((x - px) ** 2 + (y - py) ** 2 < minimum_distance_sq for px, py in points):
+            continue
+        points.append((float(x), float(y)))
+    return points, shaft_mode
 
 
 def _radial_anomaly_candidates(
@@ -736,6 +1368,7 @@ def propose_hit_points(
     arrow_present: bool,
     max_points: int = 12,
     outer_radius: Optional[float] = None,
+    diagnostics: Optional[Dict[str, object]] = None,
 ) -> List[Tuple[float, float]]:
     """
     Generate conservative hit candidates after subtracting the target's radial
@@ -746,8 +1379,21 @@ def propose_hit_points(
     cx, cy = center_final
     radius = float(outer_radius) if outer_radius is not None else min(h, w) * 0.45
     sharpness = float(cv2.Laplacian(cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var())
-    if sharpness < 85.0:
+    if sharpness < MIN_IMAGE_SHARPNESS:
+        if diagnostics is not None:
+            diagnostics.update({"mode": "blur_rejected", "count": 0})
         return []
+
+    shaft_points, shaft_mode = _shaft_hit_candidates(rect_bgr, (cx, cy), radius)
+    if shaft_mode:
+        # A visible shaft is direct evidence of a current arrow. Do not mix it
+        # with compact radial anomalies: on a well-used target those are mostly
+        # historical holes and would silently fill the requested arrow count.
+        selected = shaft_points[:max_points]
+        if diagnostics is not None:
+            diagnostics.update({"mode": "visible_shafts", "count": len(selected)})
+        return selected
+
     ranked = _radial_anomaly_candidates(
         rect_bgr,
         (cx, cy),
@@ -773,4 +1419,6 @@ def propose_hit_points(
         if len(dedup) >= max_points:
             break
 
+    if diagnostics is not None:
+        diagnostics.update({"mode": "radial_anomalies", "count": len(dedup)})
     return dedup

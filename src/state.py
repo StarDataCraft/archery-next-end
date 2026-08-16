@@ -37,6 +37,8 @@ DEFAULTS = {
     "overlay_image_rgb": None,
     "auto_points": None,
     "warp_debug": None,
+    "cv_detection_mode": None,
+    "detected_arrow_count": None,
 
     # NEW: coaching profile ("之前登录的内容")
     "user_profile": {
@@ -85,6 +87,8 @@ def reset_cv_cache():
     st.session_state.auto_points = None
     st.session_state.warp_debug = None
     st.session_state.cv_quality = None
+    st.session_state.cv_detection_mode = None
+    st.session_state.detected_arrow_count = None
     st.session_state._geom_center = None
     st.session_state._geom_outer = None
     st.session_state._rect_photo_bgr = None

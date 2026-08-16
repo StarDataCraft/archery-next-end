@@ -154,6 +154,26 @@ class BookCoachTests(unittest.TestCase):
         self.assertIn("第 6 箭", result["diagnosis"]["evidence"])
         self.assertIn("不要因为一支异常箭", result["feedback"]["do_not_change"])
 
+    def test_coaching_uses_the_detected_five_arrow_end_size(self):
+        value = metrics(spread=31, sx=35, sy=18)
+        value.update({
+            "n": 5,
+            "anisotropy": 1.94,
+            "outlier": {
+                "present": True,
+                "index": 4,
+                "distance": 150.0,
+                "core_spread": 8.0,
+                "improvement_ratio": 0.74,
+            },
+        })
+
+        result = advice_for(value, "horizontal")
+
+        self.assertIn("4/5", result["feedback"]["success_criterion"])
+        self.assertIn("5箭", result["drill"]["name"])
+        self.assertNotIn("6箭", result["drill"]["name"])
+
     def test_feedback_exposes_uncertainty_and_a_measurable_next_end_test(self):
         result = advice_for(metrics(spread=42, sx=40, sy=9), "horizontal")
 
