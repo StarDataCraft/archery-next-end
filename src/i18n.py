@@ -63,6 +63,11 @@ TEXT = {
         "en": "The photo has too little contrast for stable thin-shaft positions. Retake it in brighter, more even light.",
         "zh": "照片明暗对比不足，细箭杆的位置可能不稳定；建议在更明亮、均匀的光线下重新拍摄。",
     },
+    "exposure_warning": {
+        "ja": "暗すぎる部分または強い反射でシャフト位置が不安定なため、自動点は表示しません。均一な明るさで撮り直してください。",
+        "en": "Dark areas or strong glare make shaft positions unstable, so automatic points were withheld. Retake the photo in even light.",
+        "zh": "照片过暗或有强反光，箭杆位置可能失真，因此已停止自动标点；请在均匀光线下重新拍摄。",
+    },
     "partial_points": {
         "ja": "高確信の候補を {count} / {need} 点だけ表示しています。残りはクリックで追加してください。",
         "en": "Only {count} of {need} high-confidence candidates were kept. Click to add the rest.",

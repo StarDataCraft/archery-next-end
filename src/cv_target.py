@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Sequence
 import numpy as np
 import cv2
 
@@ -36,6 +36,8 @@ CANON_CENTER = (CANON_SIZE / 2.0, CANON_SIZE / 2.0)
 CANON_OUTER = CANON_SIZE * 0.45  # 405
 MIN_IMAGE_SHARPNESS = 90.0
 MIN_IMAGE_CONTRAST = 170.0
+MAX_DARK_CENTER_FRACTION = 0.035
+MAX_GLARE_CENTER_FRACTION = 0.040
 
 
 def _rgb_to_bgr(rgb: np.ndarray) -> np.ndarray:
@@ -73,6 +75,36 @@ def _normalize_gray_contrast(gray: np.ndarray) -> np.ndarray:
 def _gray_contrast_span(gray: np.ndarray) -> float:
     low, high = np.percentile(np.asarray(gray, dtype=np.uint8), (2.0, 98.0))
     return float(high - low)
+
+
+def _exposure_diagnostics(
+    bgr: np.ndarray,
+    center: Tuple[float, float],
+    outer_radius: float,
+) -> Dict[str, float]:
+    """Measure severe underexposure and washed-out glare near the scoring area."""
+    h, w = bgr.shape[:2]
+    yy, xx = np.indices((h, w), dtype=np.float32)
+    central = (
+        np.hypot(xx - float(center[0]), yy - float(center[1]))
+        < float(outer_radius) * 0.65
+    )
+    if not np.any(central):
+        return {"image_dark_fraction": 0.0, "image_glare_fraction": 0.0}
+
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    dark_fraction = float(np.mean(gray[central] < 20))
+    # Real target colours are bright but strongly saturated. Glare instead
+    # creates broad near-white patches, so require both high value and reduced
+    # saturation to avoid flagging clean gold/red/blue printing.
+    glare_fraction = float(
+        np.mean((hsv[:, :, 2][central] >= 245) & (hsv[:, :, 1][central] < 180))
+    )
+    return {
+        "image_dark_fraction": dark_fraction,
+        "image_glare_fraction": glare_fraction,
+    }
 
 
 def _fit_colored_target_ellipse(
@@ -655,6 +687,16 @@ def _quality_from_debug(debug: Dict[str, object]) -> Tuple[float, List[str]]:
         score -= 0.15
         flags.append("image_low_contrast")
 
+    dark_fraction = float(debug.get("image_dark_fraction", 0.0) or 0.0)
+    if dark_fraction > MAX_DARK_CENTER_FRACTION:
+        score -= 0.25
+        flags.append("image_low_light")
+
+    glare_fraction = float(debug.get("image_glare_fraction", 0.0) or 0.0)
+    if glare_fraction > MAX_GLARE_CENTER_FRACTION:
+        score -= 0.25
+        flags.append("image_glare")
+
     score = float(max(0.0, min(1.0, score)))
     if score < 0.55:
         flags.append("low_confidence")
@@ -680,6 +722,7 @@ def rectify_target(image_rgb: np.ndarray, out_size: int = CANON_SIZE) -> TargetR
             ).var()
         )
         contrast = _gray_contrast_span(color_gray)
+        exposure_debug = _exposure_diagnostics(color_rect, center, outer_radius)
         color_debug.update(
             {
                 "arrow_present": arrow_present,
@@ -688,6 +731,7 @@ def rectify_target(image_rgb: np.ndarray, out_size: int = CANON_SIZE) -> TargetR
                 "image_contrast": contrast,
                 "center_final_source": "color_ring",
                 "outer_radius_source": "red_zone_ratio",
+                **exposure_debug,
             }
         )
 
@@ -703,6 +747,12 @@ def rectify_target(image_rgb: np.ndarray, out_size: int = CANON_SIZE) -> TargetR
         if contrast < MIN_IMAGE_CONTRAST:
             quality_score -= 0.15
             quality_flags.append("image_low_contrast")
+        if exposure_debug["image_dark_fraction"] > MAX_DARK_CENTER_FRACTION:
+            quality_score -= 0.25
+            quality_flags.append("image_low_light")
+        if exposure_debug["image_glare_fraction"] > MAX_GLARE_CENTER_FRACTION:
+            quality_score -= 0.25
+            quality_flags.append("image_glare")
         quality_score = float(max(0.0, min(1.0, quality_score)))
         if quality_score < 0.55:
             quality_flags.append("low_confidence")
@@ -789,6 +839,7 @@ def rectify_target(image_rgb: np.ndarray, out_size: int = CANON_SIZE) -> TargetR
         debug["outer_radius_source"] = "hough_circle"
 
     debug["outer_radius_final"] = float(outer_radius)
+    debug.update(_exposure_diagnostics(rect3, center_final, outer_radius))
 
     # build mapping
     M_rect_to_canon = _build_similarity_M(center_final, outer_radius, angle_deg=0.0)
@@ -1694,10 +1745,18 @@ def _shaft_hit_candidates(
     outer_radius: float,
 ) -> Tuple[List[Tuple[float, float]], bool]:
     fletched, groups = _fletched_shaft_candidates(rect_bgr, center, outer_radius)
-    extra = _unfletched_shaft_candidates(rect_bgr, center, outer_radius, groups)
-    extra.extend(
-        _paired_edge_shaft_candidates(rect_bgr, center, outer_radius, fletched)
+    hough_extra = _unfletched_shaft_candidates(rect_bgr, center, outer_radius, groups)
+    paired_extra = _paired_edge_shaft_candidates(
+        rect_bgr,
+        center,
+        outer_radius,
+        fletched,
     )
+    # A pair of visible shaft edges is stronger evidence than loose Hough
+    # fragments. Combining both lists counted the same real shaft plus one
+    # unrelated target line as two arrows after mild exposure changes. Keep
+    # Hough as the fallback only when no paired-edge shaft survives.
+    extra = paired_extra if paired_extra else hough_extra
     # A saturated colour blob alone is not proof of a current arrow. Only an
     # accepted traced shaft may suppress the historical-hole fallback.
     shaft_mode = bool(fletched or extra)
@@ -1848,6 +1907,7 @@ def propose_hit_points(
     max_points: int = 12,
     outer_radius: Optional[float] = None,
     diagnostics: Optional[Dict[str, object]] = None,
+    quality_flags: Optional[Sequence[str]] = None,
 ) -> List[Tuple[float, float]]:
     """
     Generate conservative hit candidates after subtracting the target's radial
@@ -1857,6 +1917,19 @@ def propose_hit_points(
     h, w = rect_bgr.shape[:2]
     cx, cy = center_final
     radius = float(outer_radius) if outer_radius is not None else min(h, w) * 0.45
+    unstable_exposure = {"image_low_light", "image_glare"}.intersection(
+        quality_flags or []
+    )
+    if unstable_exposure:
+        if diagnostics is not None:
+            diagnostics.update(
+                {
+                    "mode": "exposure_rejected",
+                    "count": 0,
+                    "quality_flags": sorted(unstable_exposure),
+                }
+            )
+        return []
     sharpness = float(cv2.Laplacian(cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var())
     if sharpness < MIN_IMAGE_SHARPNESS:
         if diagnostics is not None:

@@ -374,6 +374,7 @@ def render_analyze_step():
                     max_points=max(need, 12),
                     outer_radius=rect_res.outer_radius,
                     diagnostics=proposal_debug,
+                    quality_flags=rect_res.quality_flags,
                 )
                 rect_res.debug["hit_detection"] = proposal_debug
 
@@ -444,12 +445,18 @@ def render_analyze_step():
         )
     if "image_blur" in quality_flags:
         st.warning(t("blur_warning", lang))
+    elif {"image_low_light", "image_glare"}.intersection(quality_flags):
+        st.warning(t("exposure_warning", lang))
     elif "image_low_contrast" in quality_flags:
         st.warning(t("contrast_warning", lang))
     elif quality is not None and float(quality.get("score", 1.0)) < 0.55:
         st.warning(t("quality_warning", lang))
     if not auto_pts:
-        st.info(t("manual_points", lang))
+        if st.session_state.get("cv_detection_mode") not in {
+            "blur_rejected",
+            "exposure_rejected",
+        }:
+            st.info(t("manual_points", lang))
     elif len(st.session_state.points) < need:
         st.info(
             t("partial_points", lang).format(
@@ -515,7 +522,11 @@ def render_analyze_step():
 
     col1, col2 = st.columns([1, 1])
     with col1:
-        analyze_clicked = st.button(t("analyze", lang), use_container_width=True)
+        analyze_clicked = st.button(
+            t("analyze", lang),
+            use_container_width=True,
+            disabled=len(points) < need,
+        )
     with col2:
         save_clicked = st.button(t("save_log", lang), use_container_width=True)
 

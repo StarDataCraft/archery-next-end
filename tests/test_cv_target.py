@@ -329,6 +329,98 @@ class HitCandidateAccuracyTests(unittest.TestCase):
         self.assertIn("image_low_contrast", result.quality_flags)
         self.assertLess(result.debug["image_contrast"], 170.0)
 
+    def test_paired_edges_prevent_a_mild_exposure_duplicate(self):
+        fixture = Path(__file__).parent / "fixtures" / "worn_target_five_arrows.jpg"
+        image = cv2.imread(str(fixture))
+        mildly_dark = np.clip(
+            (image.astype(np.float32) / 255.0) ** 1.2 * 255.0,
+            0,
+            255,
+        ).astype(np.uint8)
+        expected = np.array(
+            [
+                (366.8, 392.5),
+                (427.9, 406.1),
+                (351.0, 412.1),
+                (448.1, 522.1),
+                (625.3, 531.6),
+            ],
+            dtype=np.float32,
+        )
+
+        result = rectify_target(cv2.cvtColor(mildly_dark, cv2.COLOR_BGR2RGB))
+        diagnostics = {}
+        proposed_rect = propose_hit_points(
+            result.rect_bgr,
+            result.center_final,
+            result.arrow_present,
+            max_points=12,
+            outer_radius=result.outer_radius,
+            diagnostics=diagnostics,
+            quality_flags=result.quality_flags,
+        )
+        proposed = np.array(
+            transform_points(proposed_rect, result.M_rect_to_canon),
+            dtype=np.float32,
+        )
+
+        self.assertEqual(diagnostics["mode"], "visible_shafts")
+        self.assertEqual(len(proposed), 5)
+        nearest_errors = [
+            float(np.min(np.linalg.norm(proposed - point, axis=1)))
+            for point in expected
+        ]
+        self.assertLess(max(nearest_errors), 22.0)
+
+    def test_severe_exposure_is_flagged_and_auto_points_are_withheld(self):
+        fixture = Path(__file__).parent / "fixtures" / "worn_target_five_arrows.jpg"
+        image = cv2.imread(str(fixture))
+        height, width = image.shape[:2]
+        yy, xx = np.mgrid[0:height, 0:width]
+        glare_mask = np.exp(
+            -(
+                (xx - width * 0.40) ** 2
+                + (yy - height * 0.42) ** 2
+            )
+            / (2.0 * (width * 0.12) ** 2)
+        )
+        variants = {
+            "low_light": (
+                np.clip(
+                    (image.astype(np.float32) / 255.0) ** 1.6 * 255.0,
+                    0,
+                    255,
+                ).astype(np.uint8),
+                "image_low_light",
+            ),
+            "glare": (
+                np.clip(
+                    image.astype(np.float32) + 60.0 * glare_mask[:, :, None],
+                    0,
+                    255,
+                ).astype(np.uint8),
+                "image_glare",
+            ),
+        }
+
+        for name, (variant, expected_flag) in variants.items():
+            with self.subTest(name=name):
+                result = rectify_target(cv2.cvtColor(variant, cv2.COLOR_BGR2RGB))
+                diagnostics = {}
+                proposed = propose_hit_points(
+                    result.rect_bgr,
+                    result.center_final,
+                    result.arrow_present,
+                    max_points=12,
+                    outer_radius=result.outer_radius,
+                    diagnostics=diagnostics,
+                    quality_flags=result.quality_flags,
+                )
+
+                self.assertIn(expected_flag, result.quality_flags)
+                self.assertEqual(proposed, [])
+                self.assertEqual(diagnostics["mode"], "exposure_rejected")
+
     @patch("src.cv_target._paired_edge_shaft_candidates", return_value=[])
     @patch("src.cv_target._unfletched_shaft_candidates", return_value=[])
     @patch("src.cv_target._fletched_shaft_candidates")
