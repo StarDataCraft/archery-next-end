@@ -1,5 +1,5 @@
 # app.py
-# Deployment marker: visible-shaft recognition rollout (2026-08-16).
+# Deployment marker: exposure-safe shaft recognition rollout (2026-08-17).
 import streamlit as st
 
 from src.state import init_state, goto_step
